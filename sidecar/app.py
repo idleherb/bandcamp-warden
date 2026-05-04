@@ -77,6 +77,10 @@ class Settings(BaseSettings):
     cookie_warn_threshold_days: int = 14
     cookie_check_hour: int = 12     # daily check at midday — shows up at a sane time
 
+    # Resilience: auto-retry after bandcampsync crash (network blip, etc.)
+    retry_max_per_day: int = 3
+    retry_backoffs_minutes: list[int] = Field(default_factory=lambda: [5, 15, 60])
+
     # Telegram
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -158,6 +162,9 @@ class State:
             # because SQLite's IF NOT EXISTS doesn't apply to ADD COLUMN.
             for stmt in (
                 "ALTER TABLE warden ADD COLUMN last_cookie_warning_on TEXT",
+                "ALTER TABLE daily_runs ADD COLUMN baseline INTEGER",
+                "ALTER TABLE daily_runs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE daily_runs ADD COLUMN last_exit_code INTEGER",
             ):
                 try:
                     db.execute(stmt)
@@ -181,14 +188,39 @@ class State:
         with self._conn() as db:
             db.execute(f"UPDATE warden SET {sets} WHERE id = 1", list(fields.values()))
 
-    def start_run(self, run_date: str, quota: int) -> None:
+    def start_run(self, run_date: str, quota: int, baseline: int) -> dict:
+        """Begin (or continue) a daily run. Returns the row, including the
+        attempt number. baseline is set on first attempt and preserved
+        across retries — that way the daily quota is enforced over the
+        whole day, not reset on each retry."""
+        now = datetime.now(timezone.utc).isoformat()
         with self._conn() as db:
-            db.execute(
-                """INSERT OR REPLACE INTO daily_runs
-                   (run_date, quota, downloaded, started_at, status)
-                   VALUES (?, ?, 0, ?, 'running')""",
-                (run_date, quota, datetime.now(timezone.utc).isoformat()),
-            )
+            existing = db.execute(
+                "SELECT * FROM daily_runs WHERE run_date = ?", (run_date,)
+            ).fetchone()
+            if existing is None:
+                db.execute(
+                    """INSERT INTO daily_runs
+                       (run_date, quota, downloaded, baseline, attempt, started_at, status)
+                       VALUES (?, ?, 0, ?, 1, ?, 'running')""",
+                    (run_date, quota, baseline, now),
+                )
+            else:
+                # Retry: bump attempt, keep baseline, clear terminal fields.
+                db.execute(
+                    """UPDATE daily_runs
+                       SET attempt = attempt + 1,
+                           status = 'running',
+                           stop_reason = NULL,
+                           finished_at = NULL,
+                           last_exit_code = NULL
+                       WHERE run_date = ?""",
+                    (run_date,),
+                )
+            row = db.execute(
+                "SELECT * FROM daily_runs WHERE run_date = ?", (run_date,)
+            ).fetchone()
+        return dict(row)
 
     def update_run(self, run_date: str, **fields) -> None:
         if not fields:
@@ -377,6 +409,17 @@ class BandcampsyncController:
             return c.status == "running"
         except docker.errors.NotFound:
             return False
+
+    def last_exit_code(self) -> int | None:
+        """Exit code of the bandcampsync container's last run, or None
+        if no container exists (yet) or status not exposed."""
+        try:
+            c = self.client.containers.get(self.settings.bandcampsync_container)
+            c.reload()
+            ec = c.attrs.get("State", {}).get("ExitCode")
+            return int(ec) if ec is not None else None
+        except docker.errors.NotFound:
+            return None
 
     def stream_logs(self, container) -> Iterable[str]:
         """Yield decoded log lines as bandcampsync produces them."""
@@ -594,7 +637,11 @@ class MetadataEnricher:
             except Exception as e:
                 log.error("Failed appending to album_index.jsonl: %s", e)
 
-            # Per-album file: only if folder exists; else log to orphan jsonl
+            # Per-album file: write into the album folder if we can,
+            # otherwise count as orphaned and append to the fallback jsonl.
+            # "Orphaned" includes both no-such-folder and write-failed
+            # (e.g. PermissionError when /downloads is mounted read-only).
+            wrote_per_album = False
             if folder.exists() and folder.is_dir():
                 try:
                     self._atomic_write(
@@ -602,9 +649,10 @@ class MetadataEnricher:
                         json.dumps(record, ensure_ascii=False, indent=2),
                     )
                     written += 1
+                    wrote_per_album = True
                 except Exception as e:
-                    log.error("Failed writing %s: %s", folder, e)
-            else:
+                    log.error("Failed writing %s/bandcamp_%d.json: %s", folder, item_id, e)
+            if not wrote_per_album:
                 orphaned += 1
                 try:
                     with self.orphan_path.open("a", encoding="utf-8") as f:
@@ -642,6 +690,13 @@ class Orchestrator:
         self.log_buffer: deque[str] = deque(maxlen=settings.log_buffer_size)
         self._run_lock = asyncio.Lock()
         self._last_download_at: str | None = None
+        # Set by /stop to suppress the auto-retry that would otherwise fire
+        # when the bandcampsync container exits with a non-zero code due to
+        # being SIGTERM'd. Cleared at the start of every kickoff.
+        self._user_stop_requested: bool = False
+        # Track the asyncio task scheduling the next retry, so /stop or a
+        # repeat /trigger can cancel it cleanly.
+        self._retry_task: asyncio.Task | None = None
 
     def quota_for_day(self, day_index: int) -> int:
         ramps = self.settings.ramp_quotas or [200]
@@ -730,14 +785,36 @@ class Orchestrator:
 
         day_index = self.days_in(s["started_on"])
         quota = self.quota_for_day(day_index)
-        baseline = count_completed_albums(self.config_view)
-        self.state.start_run(run_date, quota)
 
-        await self.telegram.send(
+        # Baseline must be set ONCE per day and reused across retries —
+        # otherwise a retry resets the count and we'd download up to
+        # `quota` more albums per attempt instead of `quota` total today.
+        existing_run = self.state.get_run(run_date)
+        if existing_run and existing_run.get("baseline") is not None:
+            baseline = existing_run["baseline"]
+        else:
+            baseline = count_completed_albums(self.config_view)
+
+        run_row = self.state.start_run(run_date, quota, baseline)
+        attempt = run_row.get("attempt", 1)
+        is_retry = attempt > 1
+
+        kickoff_msg = (
             f"▶ *Tag {day_index + 1} startet* (`{run_date}`)\n"
             f"Quota heute: *{quota}* Alben\n"
             f"Bisher gesamt: *{baseline}* Alben"
         )
+        if is_retry:
+            kickoff_msg = (
+                f"🔁 *Tag {day_index + 1} Retry {attempt}/{self.settings.retry_max_per_day + 1}*"
+                f" (`{run_date}`)\n"
+                f"Bisher heute geschafft: *{count_completed_albums(self.config_view) - baseline}*/{quota}\n"
+                f"Gesamt: *{count_completed_albums(self.config_view)}*"
+            )
+        await self.telegram.send(kickoff_msg)
+
+        # Reset user-stop signal at the start of every new attempt.
+        self._user_stop_requested = False
 
         try:
             container = self.controller.start()
@@ -753,9 +830,9 @@ class Orchestrator:
             return
 
         self.enricher.begin_run()
-        await self._monitor(run_date, baseline, quota, container)
+        await self._monitor(run_date, baseline, quota, container, attempt)
 
-    async def _monitor(self, run_date: str, baseline: int, quota: int, container) -> None:
+    async def _monitor(self, run_date: str, baseline: int, quota: int, container, attempt: int) -> None:
         recent: deque[str] = deque(maxlen=self.settings.anomaly_window)
         loop = asyncio.get_event_loop()
         line_queue: asyncio.Queue[str | None] = asyncio.Queue()
@@ -836,8 +913,10 @@ class Orchestrator:
                     stop_reason = "quota_hit"
                     break
 
-        # Make sure bandcampsync is actually stopped.
+        # Make sure bandcampsync is actually stopped, then capture its exit
+        # code while the container still exists.
         self.controller.stop()
+        exit_code = self.controller.last_exit_code()
         final = count_completed_albums(self.config_view)
         downloaded_today = final - baseline
         finished_at = datetime.now(timezone.utc).isoformat()
@@ -847,6 +926,8 @@ class Orchestrator:
         # the message so the user sees the metadata-write summary in the
         # same notification.
         msg: str
+        will_retry = False
+        retry_delay_min: int | None = None
         if stop_reason == "emergency":
             recent_tail = "\n".join(list(recent)[-6:])
             self.state.update(
@@ -898,42 +979,88 @@ class Orchestrator:
                 f"Heute: *{downloaded_today}*/{quota}, Gesamt: *{final}*.\n"
                 "Run war ungewöhnlich lang. Bitte `/logs` prüfen."
             )
-        else:
-            # bandcampsync exited on its own. Two interpretations: collection
-            # done, or a hard error. If we made progress and there are no
-            # recent anomalies in the buffer, assume done.
-            had_anomaly = any(is_anomaly_line(ln) for ln in recent)
-            if downloaded_today > 0 and not had_anomaly:
-                self.state.update_run(
-                    run_date,
-                    downloaded=downloaded_today,
-                    status="completed",
-                    stop_reason="bandcampsync exited (likely caught up)",
-                    finished_at=finished_at,
+        elif self._user_stop_requested:
+            # POST /stop. SIGTERM gives a non-zero exit code that's not a
+            # crash — we suppress retry and don't touch collection_complete.
+            self.state.update_run(
+                run_date,
+                downloaded=downloaded_today,
+                status="completed",
+                stop_reason="user-initiated stop",
+                last_exit_code=exit_code,
+                finished_at=finished_at,
+            )
+            msg = (
+                f"⏹ *Manuell gestoppt* (`{run_date}`)\n"
+                f"Heute: *{downloaded_today}*/{quota}, Gesamt: *{final}*"
+            )
+        elif exit_code is not None and exit_code != 0:
+            # Crash — non-zero exit, not user-initiated. Treat as transient
+            # (network blip, server stall, etc.). Schedule auto-retry up to
+            # retry_max_per_day; do NOT set collection_complete.
+            recent_tail = "\n".join(list(recent)[-6:])
+            self.state.update_run(
+                run_date,
+                downloaded=downloaded_today,
+                status="crashed",
+                stop_reason=f"bandcampsync exit code {exit_code}",
+                last_exit_code=exit_code,
+                finished_at=finished_at,
+            )
+            attempts_done = attempt
+            attempts_max = self.settings.retry_max_per_day + 1  # 1 initial + N retries
+            if attempts_done < attempts_max:
+                backoffs = self.settings.retry_backoffs_minutes or [10]
+                # attempt=1 means first crash → use backoffs[0], attempt=2 → backoffs[1], …
+                retry_delay_min = backoffs[min(attempts_done - 1, len(backoffs) - 1)]
+                will_retry = True
+                msg = (
+                    f"⚠️ *bandcampsync gecrasht* (Exit `{exit_code}`)\n"
+                    f"Heute: *{downloaded_today}*/{quota}, Gesamt: *{final}*.\n"
+                    f"Auto-Retry in *{retry_delay_min} Min* "
+                    f"(Versuch {attempts_done + 1}/{attempts_max}).\n\n"
+                    f"Letzte Zeilen:\n```\n{recent_tail[:800]}\n```"
                 )
-                self.state.update(collection_complete=1 if downloaded_today < quota else 0)
+            else:
+                msg = (
+                    f"❌ *bandcampsync gecrasht* (Exit `{exit_code}`)\n"
+                    f"Max Retries ({attempts_max}) heute erreicht. "
+                    f"Heute: *{downloaded_today}*/{quota}, Gesamt: *{final}*.\n"
+                    f"Nächster Versuch morgen 03:00.\n\n"
+                    f"Letzte Zeilen:\n```\n{recent_tail[:800]}\n```"
+                )
+        else:
+            # exit_code == 0 (or unknown). Clean exit means bandcampsync
+            # walked the whole collection and found nothing else outstanding.
+            self.state.update_run(
+                run_date,
+                downloaded=downloaded_today,
+                status="completed",
+                stop_reason="bandcampsync exited cleanly",
+                last_exit_code=exit_code,
+                finished_at=finished_at,
+            )
+            if downloaded_today > 0 and downloaded_today < quota:
+                # Caught up before hitting quota → collection complete.
+                self.state.update(collection_complete=1)
                 msg = (
                     "🎉 *Collection vollständig*\n"
-                    f"bandcampsync hat sich beendet, keine ausstehenden Alben mehr.\n"
+                    f"bandcampsync hat sich beendet — keine ausstehenden Alben mehr.\n"
                     f"Gesamt: *{final}*"
-                    if downloaded_today < quota
-                    else f"✅ *Tag fertig* (`{run_date}`)\n"
-                    f"bandcampsync hat exakt die Quota geliefert: *{downloaded_today}*/{quota}\n"
+                )
+            elif downloaded_today >= quota:
+                msg = (
+                    f"✅ *Tag fertig* (`{run_date}`)\n"
+                    f"bandcampsync exakt an Quota: *{downloaded_today}*/{quota}\n"
                     f"Gesamt: *{final}*"
                 )
             else:
-                self.state.update_run(
-                    run_date,
-                    downloaded=downloaded_today,
-                    status="completed",
-                    stop_reason="bandcampsync exited unexpectedly",
-                    finished_at=finished_at,
-                )
-                recent_tail = "\n".join(list(recent)[-6:])
+                # Clean exit with 0 downloads — cookie problem, empty
+                # collection, or already-fully-synced. Surface for review.
                 msg = (
-                    "⚠️ *bandcampsync hat unerwartet beendet*\n"
-                    f"Heute: *{downloaded_today}*/{quota}, Gesamt: *{final}*.\n"
-                    f"Letzte Zeilen:\n```\n{recent_tail[:800]}\n```"
+                    "ℹ️ *bandcampsync sauber beendet, 0 Alben*\n"
+                    f"Cookie OK? Sammlung leer? Schon vollständig?\n"
+                    f"Gesamt: *{final}*"
                 )
 
         # Enrich whatever we managed to download this run, and append the
@@ -956,6 +1083,29 @@ class Orchestrator:
             )
 
         await self.telegram.send(msg)
+
+        # Auto-retry after a crash. We fire-and-forget an asyncio task that
+        # waits, then re-enters daily_kickoff. The kickoff logic itself
+        # checks _run_lock + emergency_stopped + collection_complete, so
+        # the retry is safe even if state changes meanwhile.
+        if will_retry and retry_delay_min is not None:
+            self._schedule_retry(retry_delay_min * 60)
+
+    def _schedule_retry(self, delay_seconds: int) -> None:
+        """Schedule a single retry of daily_kickoff after delay_seconds."""
+        # Cancel any previously-pending retry to avoid stacking.
+        if self._retry_task and not self._retry_task.done():
+            self._retry_task.cancel()
+
+        async def _retry():
+            try:
+                await asyncio.sleep(delay_seconds)
+            except asyncio.CancelledError:
+                return
+            log.info("Auto-retry firing after %ds", delay_seconds)
+            await self.daily_kickoff()
+
+        self._retry_task = asyncio.create_task(_retry())
 
     def status(self) -> dict:
         s = self.state.get()
@@ -1072,7 +1222,11 @@ async def trigger_now() -> dict:
 
 @app.post("/stop")
 async def stop_now() -> dict:
-    """Force-stop bandcampsync (does NOT trip the emergency flag)."""
+    """Force-stop bandcampsync. Suppresses any auto-retry that would
+    otherwise fire (since SIGTERM gives a non-zero exit code)."""
+    orchestrator._user_stop_requested = True
+    if orchestrator._retry_task and not orchestrator._retry_task.done():
+        orchestrator._retry_task.cancel()
     controller.stop()
     return {"stopped": True}
 
@@ -1094,4 +1248,13 @@ async def reset_emergency() -> dict:
         last_emergency_at=None,
         last_emergency_reason=None,
     )
+    return {"reset": True}
+
+
+@app.post("/reset-completion")
+async def reset_completion() -> dict:
+    """Clear the collection_complete flag so the daily scheduler resumes.
+    Useful if a transient failure (network, crash) was misclassified as
+    'caught up'."""
+    state.update(collection_complete=0)
     return {"reset": True}

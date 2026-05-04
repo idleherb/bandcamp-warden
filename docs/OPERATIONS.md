@@ -111,15 +111,26 @@ Steps:
 # Run now (respects today's quota; idempotent if already running)
 curl -X POST http://homeserver:31080/trigger
 
-# Stop the current bandcampsync mid-run (does NOT trip emergency)
+# Stop the current bandcampsync mid-run (does NOT trip emergency, also
+# cancels any pending auto-retry)
 curl -X POST http://homeserver:31080/stop
 
 # Reset emergency flag after investigation
 curl -X POST http://homeserver:31080/reset-emergency
 
+# Clear collection_complete (use if a transient failure was misclassified
+# as 'caught up' and the scheduler is now skipping all kickoffs)
+curl -X POST http://homeserver:31080/reset-completion
+
 # Force a cookie check now (bypasses once-per-day debounce)
 curl -X POST http://homeserver:31080/check-cookie
 ```
+
+## Auto-retry on bandcampsync crashes
+
+If bandcampsync exits with a non-zero code (network blip, ISP outage, server stall, etc.) the sidecar treats it as a **transient failure**, not a completion. It does not set `collection_complete`. It schedules an automatic retry per `WARDEN_RETRY_BACKOFFS_MINUTES` (default `[5, 15, 60]`), capped at `WARDEN_RETRY_MAX_PER_DAY` retries (default 3 → 1 initial + 3 retries = 4 attempts max). The baseline downloaded-count for the day is preserved across retries, so the daily quota is enforced over the whole day rather than reset on each attempt. Telegram says `🔁 Tag N Retry M/X` for each retry attempt.
+
+Manual `POST /stop` cancels any pending retry; the scheduler resumes normally at 03:00 the next day.
 
 ## Updating
 
