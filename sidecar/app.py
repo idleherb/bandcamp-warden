@@ -107,6 +107,20 @@ ANOMALY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"rate[- ]?limit", re.IGNORECASE),
 )
 
+# bandcampsync logs at standard Python levels: [INFO] for routine progress,
+# [WARNING]/[ERROR] for actual problems. Album titles and artist names appear
+# only in [INFO] lines (e.g. "Found item: forbidden cremme / opulence"). To
+# avoid false-positive emergency stops on artist names that happen to contain
+# words like "forbidden" or "unauthorized", we only run anomaly detection on
+# non-INFO lines.
+INFO_LINE = re.compile(r"\[INFO\]")
+
+
+def is_anomaly_line(line: str) -> bool:
+    if INFO_LINE.search(line):
+        return False
+    return any(p.search(line) for p in ANOMALY_PATTERNS)
+
 
 # ---------- State (SQLite) ----------
 
@@ -548,12 +562,11 @@ class Orchestrator:
             self.log_buffer.append(line)
             recent.append(line)
 
-            # Anomaly detection runs on every line (cheap regex on short string).
-            if any(p.search(line) for p in ANOMALY_PATTERNS):
-                anomaly_hits = sum(
-                    1 for ln in recent
-                    if any(p.search(ln) for p in ANOMALY_PATTERNS)
-                )
+            # Anomaly detection runs only on non-INFO lines so artist/album
+            # names containing words like "forbidden" don't trigger false
+            # positives. Real auth/rate errors land at WARNING/ERROR.
+            if is_anomaly_line(line):
+                anomaly_hits = sum(1 for ln in recent if is_anomaly_line(ln))
                 if anomaly_hits >= self.settings.anomaly_threshold:
                     stop_reason = "emergency"
                     break
@@ -624,9 +637,7 @@ class Orchestrator:
         # bandcampsync exited on its own. Two interpretations: collection done,
         # or a hard error. If we made progress and there are no recent anomalies
         # in the buffer, assume done. Otherwise flag.
-        had_anomaly = any(
-            any(p.search(ln) for p in ANOMALY_PATTERNS) for ln in recent
-        )
+        had_anomaly = any(is_anomaly_line(ln) for ln in recent)
         if downloaded_today > 0 and not had_anomaly:
             self.state.update_run(
                 run_date,
