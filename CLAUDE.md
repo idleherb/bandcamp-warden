@@ -34,7 +34,7 @@ python3 -c "import ast; ast.parse(open('sidecar/app.py').read())"
 gh run watch --repo idleherb/bandcamp-warden $(gh run list --repo idleherb/bandcamp-warden --limit 1 --json databaseId --jq '.[0].databaseId') --exit-status
 
 # Hit the live sidecar from the user's Mac (LAN only — homeserver:31080)
-curl http://homeserver:31080/health
+curl http://homeserver:31080/healthz   # liveness + version/commit/channel
 curl http://homeserver:31080/status | python3 -m json.tool
 curl 'http://homeserver:31080/logs?lines=50' | python3 -m json.tool
 curl -X POST http://homeserver:31080/trigger          # immediate run, respects today's quota

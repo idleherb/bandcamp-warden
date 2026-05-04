@@ -7,7 +7,7 @@ Wraps [`meeb/bandcampsync`](https://github.com/meeb/bandcampsync) — the actual
 1. **Daily ramp-up quota** (default 30 → 100 → 200 albums/day). bandcampsync's defaults will happily try to drain a 3000-album collection in one go; that's how accounts get flagged.
 2. **Anomaly detection with auto-stop.** Three 401/403/429 responses inside a short window → bandcampsync gets killed and a Telegram alert goes out. The previous tool that cost the user's account did not have this; this is the central reason this project exists.
 3. **Cookie expiry monitoring.** Daily check on the `identity` cookie's hard expiry; Telegram warning when under threshold (default 14 days). Catches the slow-burn case before it becomes the fast-burn case.
-4. **Observability.** Telegram for autonomous alerts, plus a LAN-only HTTP service on port 8080 (`/health`, `/status`, `/logs`) for live spot-checks.
+4. **Observability.** Telegram for autonomous alerts, plus a LAN-only HTTP service on port 8080 (`/healthz`, `/status`, `/logs`) for live spot-checks.
 
 Resume is inherited from bandcampsync: each successfully downloaded album gets a `bandcamp_item_id.txt` marker in its folder. The sidecar uses these markers as the canonical truth — it counts them at the start of each day to set a baseline, and again as bandcampsync runs to know when the daily quota is hit. If anything crashes mid-run, you lose at most one in-flight album; the rest of the queue picks up cleanly on the next run.
 
@@ -18,7 +18,7 @@ TrueNAS LAN-IP:8080  ←─── you / Claude (curl from a LAN machine)
         │
    ┌────┴───────────────────────────────────────┐
    │  warden sidecar (this repo)                │
-   │   • FastAPI: /health /status /logs         │
+   │   • FastAPI: /healthz /status /logs        │
    │   • APScheduler: daily kickoff             │
    │   • Spawns bandcampsync via Docker socket  │
    │   • Watches logs → anomaly auto-stop       │
@@ -140,7 +140,7 @@ Don't wait until 03:00 the next morning to find out if it works. From your Mac (
 ```sh
 # Replace with your TrueNAS LAN IP
 TRUENAS=192.168.1.42
-curl http://$TRUENAS:8080/health     # should return {"status":"ok"}
+curl http://$TRUENAS:8080/healthz    # should return {"ok":true,"version":"...","channel":"...","commit":"..."}
 curl http://$TRUENAS:8080/status     # should return state JSON
 curl -X POST http://$TRUENAS:8080/trigger  # forces an immediate run
 ```
@@ -229,7 +229,7 @@ Discogs alias resolution (collapsing different stage names of the same artist in
 
 **No Telegram message on startup.** Check the sidecar's own container logs in TrueNAS UI. Most likely: token or chat ID typo, or the bot was never sent an initial message (Telegram won't let bots message you until you message them first).
 
-**`/health` returns nothing.** Container isn't up. Check it's running, check the port mapping in compose matches `8080:8080`, check no other app is on port 8080 on the TrueNAS.
+**`/healthz` returns nothing.** Container isn't up. Check it's running, check the port mapping in compose matches `8080:8080`, check no other app is on the host port. The response includes `version` (build date) and `commit` (short SHA) — useful to confirm Watchtower has pulled the expected image.
 
 **Telegram says "bandcampsync-Start fehlgeschlagen".** The sidecar couldn't spawn the bandcampsync container. Either the image isn't pullable (network issue), or the bind-mount paths don't exist on the host. Verify `/mnt/storage/media/bandcamp` and `/mnt/apps/bandcamp-warden/config` actually exist with `ls -la` over SSH.
 

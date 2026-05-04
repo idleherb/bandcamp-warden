@@ -1039,9 +1039,15 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="bandcamp-warden", lifespan=lifespan)
 
 
-@app.get("/health")
-async def health() -> dict:
-    return {"status": "ok"}
+@app.get("/healthz")
+async def healthz() -> dict:
+    """Liveness + build provenance. Build args injected by GHA at image build."""
+    return {
+        "ok": True,
+        "version": os.getenv("WARDEN_BUILD_DATE", "unknown"),
+        "channel": os.getenv("WARDEN_GIT_BRANCH", "unknown"),
+        "commit": os.getenv("WARDEN_GIT_COMMIT", "unknown")[:7],
+    }
 
 
 @app.get("/status")
