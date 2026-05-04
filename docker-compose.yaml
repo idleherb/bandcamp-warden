@@ -38,6 +38,9 @@ services:
       WARDEN_ANOMALY_WINDOW: "15"
       WARDEN_ANOMALY_THRESHOLD: "3"
 
+      # --- cookie expiry monitoring ---
+      WARDEN_COOKIE_WARN_THRESHOLD_DAYS: "${COOKIE_WARN_THRESHOLD_DAYS:-14}"
+
       TZ: "${TIMEZONE:-Europe/Berlin}"
     volumes:
       # Docker socket — required so the sidecar can spawn/stop bandcampsync.
@@ -50,6 +53,10 @@ services:
       # Read-only view of the music output, used to count completed albums
       # via the bandcamp_item_id.txt markers.
       - ${HOST_DOWNLOADS_PATH:-/mnt/storage/media/bandcamp}:/downloads:ro
+
+      # Read-only view of bandcampsync's config dir so the sidecar can parse
+      # cookies.txt and warn before the identity cookie expires.
+      - ${HOST_CONFIG_PATH:-/mnt/apps/bandcamp-warden/config}:/config:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=3).status==200 else 1)"]
       interval: 30s

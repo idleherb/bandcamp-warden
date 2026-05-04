@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     anomaly_threshold: int = 3      # matches in the window → emergency stop
     log_buffer_size: int = 2000     # in-memory ring buffer exposed via /logs
 
+    # Cookie expiry monitoring
+    cookies_path: str = "/config/cookies.txt"
+    cookie_warn_threshold_days: int = 14
+    cookie_check_hour: int = 12     # daily check at midday — shows up at a sane time
+
     # Telegram
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -132,6 +137,15 @@ class State:
                 INSERT OR IGNORE INTO warden (id) VALUES (1);
                 """
             )
+            # Best-effort additive schema migrations. Each ALTER is wrapped
+            # because SQLite's IF NOT EXISTS doesn't apply to ADD COLUMN.
+            for stmt in (
+                "ALTER TABLE warden ADD COLUMN last_cookie_warning_on TEXT",
+            ):
+                try:
+                    db.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
     def _conn(self) -> sqlite3.Connection:
         c = sqlite3.connect(self.path, timeout=10)
@@ -192,6 +206,39 @@ def count_completed_albums(downloads: Path) -> int:
     if not downloads.exists():
         return 0
     return sum(1 for _ in downloads.rglob("bandcamp_item_id.txt"))
+
+
+# ---------- Cookie expiry ----------
+
+def cookie_identity_expiry(cookies_path: Path) -> datetime | None:
+    """Read the bandcamp identity cookie's expiry from a Netscape cookies.txt.
+
+    Returns None if the file is missing, unparseable, the cookie is absent,
+    or it's a session cookie (expires=0). Server-side invalidation can still
+    kill the cookie before this timestamp — that's caught by the anomaly
+    detector, not here. This monitor only catches the hard server-set expiry.
+    """
+    if not cookies_path.exists():
+        return None
+    candidates: list[int] = []
+    for line in cookies_path.read_text(errors="replace").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        domain, _flag, _path, _secure, expires, name, _value = parts[:7]
+        if name != "identity" or "bandcamp.com" not in domain:
+            continue
+        try:
+            ts = int(expires)
+        except ValueError:
+            continue
+        if ts > 0:
+            candidates.append(ts)
+    if not candidates:
+        return None
+    return datetime.fromtimestamp(max(candidates), tz=timezone.utc)
 
 
 # ---------- Telegram ----------
@@ -339,6 +386,51 @@ class Orchestrator:
         if not started_on:
             return 0
         return (date.today() - date.fromisoformat(started_on)).days
+
+    def cookie_status(self) -> dict:
+        """Snapshot of identity-cookie expiry for /status."""
+        expiry = cookie_identity_expiry(Path(self.settings.cookies_path))
+        if not expiry:
+            return {"present": False}
+        delta = expiry - datetime.now(timezone.utc)
+        return {
+            "present": True,
+            "expires_at": expiry.isoformat(),
+            "days_remaining": max(0, delta.days),
+            "expired": delta.total_seconds() <= 0,
+        }
+
+    async def check_cookie_expiry(self) -> None:
+        """Daily cookie freshness check. Warns at most once per day under threshold."""
+        info = self.cookie_status()
+        if not info["present"]:
+            log.info("Cookie file missing or unparseable; skipping expiry check")
+            return
+        days = info["days_remaining"]
+        if not info["expired"] and days > self.settings.cookie_warn_threshold_days:
+            return  # plenty of time, stay quiet
+
+        today = date.today().isoformat()
+        s = self.state.get()
+        if s.get("last_cookie_warning_on") == today:
+            return  # already warned today, no spam
+        self.state.update(last_cookie_warning_on=today)
+
+        if info["expired"]:
+            head = "🍪 *Cookie ABGELAUFEN*"
+        elif days <= 3:
+            head = f"🍪 *Cookie läuft in {days} Tagen ab* — bitte heute erneuern"
+        else:
+            head = f"🍪 *Cookie läuft in {days} Tagen ab*"
+        await self.telegram.send(
+            f"{head}\n"
+            f"Ablauf: `{info['expires_at']}`\n\n"
+            "Erneuern:\n"
+            "1. Frischer Firefox-Login auf bandcamp.com\n"
+            "2. cookies.txt mit der Browser-Extension exportieren\n"
+            "3. Datei nach `/mnt/apps/bandcamp-warden/config/cookies.txt` kopieren\n"
+            "(Resume bleibt erhalten — die Marker liegen in den Album-Ordnern.)"
+        )
 
     async def daily_kickoff(self) -> None:
         """Top-level entry point. APScheduler fires this once per day."""
@@ -588,6 +680,7 @@ class Orchestrator:
             "last_emergency_reason": s["last_emergency_reason"],
             "collection_complete": bool(s["collection_complete"]),
             "total_complete": count_completed_albums(self.downloads_view),
+            "cookie": self.cookie_status(),
             "recent_runs": self.state.recent_runs(14),
         }
 
@@ -613,16 +706,28 @@ async def lifespan(_: FastAPI):
         coalesce=True,
         misfire_grace_time=3600,
     )
+    scheduler.add_job(
+        orchestrator.check_cookie_expiry,
+        CronTrigger(hour=settings.cookie_check_hour, minute=0),
+        id="cookie_check",
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
     log.info(
-        "Sidecar online. Daily kickoff: %02d:00 %s. Ramp quotas: %s.",
+        "Sidecar online. Daily kickoff: %02d:00 %s. Ramp quotas: %s. Cookie check: %02d:00.",
         settings.daily_run_hour, settings.timezone, settings.ramp_quotas,
+        settings.cookie_check_hour,
     )
     await telegram.send(
         "🟢 *bandcamp-warden online*\n"
         f"Daily-Kickoff: `{settings.daily_run_hour:02d}:00 {settings.timezone}`\n"
         f"Ramp-Quotas: `{settings.ramp_quotas}`"
     )
+    # Run a cookie check at startup so the user gets immediate feedback if the
+    # cookie file is missing or already near expiry, instead of waiting until
+    # tomorrow noon.
+    asyncio.create_task(orchestrator.check_cookie_expiry())
     try:
         yield
     finally:
@@ -662,6 +767,16 @@ async def stop_now() -> dict:
     """Force-stop bandcampsync (does NOT trip the emergency flag)."""
     controller.stop()
     return {"stopped": True}
+
+
+@app.post("/check-cookie")
+async def check_cookie_now() -> dict:
+    """Force a cookie expiry check and Telegram-warn if applicable."""
+    # Reset today's warning flag so the check can actually push, even if
+    # something already warned today.
+    state.update(last_cookie_warning_on=None)
+    await orchestrator.check_cookie_expiry()
+    return orchestrator.cookie_status()
 
 
 @app.post("/reset-emergency")

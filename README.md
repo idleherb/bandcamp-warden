@@ -2,11 +2,12 @@
 
 Rate-limited, ban-aware Bandcamp collection downloader for self-hosting on TrueNAS Scale.
 
-Wraps [`meeb/bandcampsync`](https://github.com/meeb/bandcampsync) — the actual downloader — with a small Python sidecar that adds three things bandcampsync alone doesn't:
+Wraps [`meeb/bandcampsync`](https://github.com/meeb/bandcampsync) — the actual downloader — with a small Python sidecar that adds four things bandcampsync alone doesn't:
 
 1. **Daily ramp-up quota** (default 30 → 100 → 200 albums/day). bandcampsync's defaults will happily try to drain a 3000-album collection in one go; that's how accounts get flagged.
 2. **Anomaly detection with auto-stop.** Three 401/403/429 responses inside a short window → bandcampsync gets killed and a Telegram alert goes out. The previous tool that cost the user's account did not have this; this is the central reason this project exists.
-3. **Observability.** Telegram for autonomous alerts, plus a LAN-only HTTP service on port 8080 (`/health`, `/status`, `/logs`) for live spot-checks.
+3. **Cookie expiry monitoring.** Daily check on the `identity` cookie's hard expiry; Telegram warning when under threshold (default 14 days). Catches the slow-burn case before it becomes the fast-burn case.
+4. **Observability.** Telegram for autonomous alerts, plus a LAN-only HTTP service on port 8080 (`/health`, `/status`, `/logs`) for live spot-checks.
 
 Resume is inherited from bandcampsync: each successfully downloaded album gets a `bandcamp_item_id.txt` marker in its folder. The sidecar uses these markers as the canonical truth — it counts them at the start of each day to set a baseline, and again as bandcampsync runs to know when the daily quota is hit. If anything crashes mid-run, you lose at most one in-flight album; the rest of the queue picks up cleanly on the next run.
 
@@ -198,9 +199,14 @@ curl -X POST http://$TRUENAS:8080/reset-emergency
 ### Manual stop / start
 
 ```sh
-curl -X POST http://$TRUENAS:8080/stop      # stop bandcampsync now (does NOT trip emergency)
-curl -X POST http://$TRUENAS:8080/trigger   # start a run now (respects today's quota)
+curl -X POST http://$TRUENAS:8080/stop           # stop bandcampsync now (does NOT trip emergency)
+curl -X POST http://$TRUENAS:8080/trigger        # start a run now (respects today's quota)
+curl -X POST http://$TRUENAS:8080/check-cookie   # force a cookie expiry check
 ```
+
+### Cookie monitoring
+
+The sidecar reads the `identity` cookie's expiry timestamp from `cookies.txt` once a day at noon (and at startup). When you're closer than `COOKIE_WARN_THRESHOLD_DAYS` (default 14) to expiry, you get a Telegram nudge — once per day, not per check, to avoid spam. Note: this only catches the **hard** expiry Bandcamp sets at cookie-creation time. Spontaneous server-side invalidation (password change, "sign out everywhere", anti-abuse flag) will not trigger this — that path is caught by the anomaly detector via 401 responses on the next download attempt.
 
 ## Folder layout
 
