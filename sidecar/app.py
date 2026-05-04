@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     # In-sidecar paths (where the sidecar itself sees the data)
     state_path: str = "/state"
     downloads_view_path: str = "/downloads"  # read-only mount of host_downloads_path
+    config_view_path: str = "/config"        # read-only mount of host_config_path
 
     # Schedule
     daily_run_hour: int = 3
@@ -212,14 +213,26 @@ class State:
         return [dict(r) for r in rows]
 
 
-# ---------- Folder counter ----------
+# ---------- Completion counter ----------
 
-def count_completed_albums(downloads: Path) -> int:
-    """Count bandcamp_item_id.txt markers — the canonical signal that bandcampsync
-    finished an album. Survives renames, container restarts, anything."""
-    if not downloads.exists():
+# bandcampsync's own truth-of-record for "what's done" in Docker mode is the
+# /config/ignores.txt file. Per bandcampsync/sync.py:191-204, the per-album
+# bandcamp_item_id.txt marker only gets written when ign_file_path is unset
+# — which is never, in Docker mode (entrypoint always sets it). So we count
+# IDs in ignores.txt: each successful download appends one line.
+def count_completed_albums(config_view: Path) -> int:
+    ignores = config_view / "ignores.txt"
+    if not ignores.exists():
         return 0
-    return sum(1 for _ in downloads.rglob("bandcamp_item_id.txt"))
+    count = 0
+    for line in ignores.read_text(errors="replace").splitlines():
+        # bandcampsync's format: comments starting with '#', plus IDs as
+        # plain integers. Strip inline comments and whitespace; count the
+        # non-empty remainder.
+        stripped = line.split("#", 1)[0].strip()
+        if stripped:
+            count += 1
+    return count
 
 
 # ---------- Cookie expiry ----------
@@ -380,13 +393,13 @@ class Orchestrator:
         state: State,
         controller: BandcampsyncController,
         telegram: Telegram,
-        downloads_view: Path,
+        config_view: Path,
         settings: Settings,
     ) -> None:
         self.state = state
         self.controller = controller
         self.telegram = telegram
-        self.downloads_view = downloads_view
+        self.config_view = config_view
         self.settings = settings
         self.log_buffer: deque[str] = deque(maxlen=settings.log_buffer_size)
         self._run_lock = asyncio.Lock()
@@ -479,7 +492,7 @@ class Orchestrator:
 
         day_index = self.days_in(s["started_on"])
         quota = self.quota_for_day(day_index)
-        baseline = count_completed_albums(self.downloads_view)
+        baseline = count_completed_albums(self.config_view)
         self.state.start_run(run_date, quota)
 
         await self.telegram.send(
@@ -528,7 +541,7 @@ class Orchestrator:
 
         def check_quota() -> tuple[bool, int]:
             nonlocal last_count
-            count = count_completed_albums(self.downloads_view)
+            count = count_completed_albums(self.config_view)
             if count != last_count:
                 self._last_download_at = datetime.now(timezone.utc).isoformat()
                 last_count = count
@@ -573,7 +586,7 @@ class Orchestrator:
 
         # Make sure bandcampsync is actually stopped.
         self.controller.stop()
-        final = count_completed_albums(self.downloads_view)
+        final = count_completed_albums(self.config_view)
         downloaded_today = final - baseline
         finished_at = datetime.now(timezone.utc).isoformat()
 
@@ -690,7 +703,7 @@ class Orchestrator:
             "last_emergency_at": s["last_emergency_at"],
             "last_emergency_reason": s["last_emergency_reason"],
             "collection_complete": bool(s["collection_complete"]),
-            "total_complete": count_completed_albums(self.downloads_view),
+            "total_complete": count_completed_albums(self.config_view),
             "cookie": self.cookie_status(),
             "recent_runs": self.state.recent_runs(14),
         }
@@ -702,7 +715,7 @@ state = State(Path(settings.state_path) / "state.db")
 controller = BandcampsyncController(settings)
 telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
 orchestrator = Orchestrator(
-    state, controller, telegram, Path(settings.downloads_view_path), settings
+    state, controller, telegram, Path(settings.config_view_path), settings
 )
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
