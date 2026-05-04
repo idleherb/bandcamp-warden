@@ -1,0 +1,58 @@
+# bandcamp-warden — TrueNAS Custom App stack
+#
+# The sidecar is the only declared service. It spawns and manages bandcampsync
+# containers programmatically via the Docker socket — fresh container per
+# daily run, removed afterwards. State persists on bind-mounted host paths.
+#
+# Before deploying: copy .env.example to .env on the TrueNAS host and fill
+# in TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, and any path overrides.
+
+services:
+  warden:
+    image: ghcr.io/idleherb/bandcamp-warden-sidecar:latest
+    container_name: bandcamp-warden-sidecar
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # --- required ---
+      WARDEN_TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+      WARDEN_TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
+      WARDEN_HOST_DOWNLOADS_PATH: "${HOST_DOWNLOADS_PATH:-/mnt/storage/media/bandcamp}"
+      WARDEN_HOST_CONFIG_PATH: "${HOST_CONFIG_PATH:-/mnt/apps/bandcamp-warden/config}"
+
+      # --- schedule + ramp ---
+      WARDEN_DAILY_RUN_HOUR: "${DAILY_RUN_HOUR:-3}"
+      WARDEN_TIMEZONE: "${TIMEZONE:-Europe/Berlin}"
+      WARDEN_RAMP_QUOTAS: "${RAMP_QUOTAS:-[30, 100, 200]}"
+
+      # --- bandcampsync tuning (conservative defaults) ---
+      WARDEN_BANDCAMPSYNC_IMAGE: "${BANDCAMPSYNC_IMAGE:-ghcr.io/meeb/bandcampsync:latest}"
+      WARDEN_BANDCAMPSYNC_CONCURRENCY: "1"
+      WARDEN_BANDCAMPSYNC_MAX_RETRIES: "3"
+      WARDEN_BANDCAMPSYNC_RETRY_WAIT: "30"
+      WARDEN_BANDCAMPSYNC_PUID: "${BANDCAMPSYNC_PUID:-1000}"
+      WARDEN_BANDCAMPSYNC_PGID: "${BANDCAMPSYNC_PGID:-568}"
+
+      # --- anomaly detection ---
+      WARDEN_ANOMALY_WINDOW: "15"
+      WARDEN_ANOMALY_THRESHOLD: "3"
+
+      TZ: "${TIMEZONE:-Europe/Berlin}"
+    volumes:
+      # Docker socket — required so the sidecar can spawn/stop bandcampsync.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # Sidecar's own state (SQLite, in-memory log buffer survives only the
+      # process). Lives on the apps pool.
+      - ${HOST_STATE_PATH:-/mnt/apps/bandcamp-warden/state}:/state
+
+      # Read-only view of the music output, used to count completed albums
+      # via the bandcamp_item_id.txt markers.
+      - ${HOST_DOWNLOADS_PATH:-/mnt/storage/media/bandcamp}:/downloads:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
