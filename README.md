@@ -114,7 +114,16 @@ nano .env
 
 Fill in `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Adjust paths if you used different dataset names. The default ramp `[30, 100, 200]` is the agreed conservative profile — only change it if you've discussed the tradeoff.
 
-### 5. Deploy as a TrueNAS Custom App
+### 5. Make the GHCR image pullable
+
+GitHub publishes container images as **private** by default, even when the source repo is public. Before TrueNAS can pull the sidecar image you need to flip the package visibility once:
+
+1. Open https://github.com/idleherb/bandcamp-warden/pkgs/container/bandcamp-warden-sidecar
+2. **Package settings** (right sidebar) → scroll to **Danger Zone** → **Change visibility** → **Public**.
+
+Skipping this step means TrueNAS will get `unauthorized` errors on `docker pull` and the sidecar will never start. Alternatively, if you'd rather keep the image private, generate a personal access token with `read:packages` scope and configure it as a registry credential in TrueNAS — but the public-flip is simpler.
+
+### 6. Deploy as a TrueNAS Custom App
 
 In the TrueNAS UI: **Apps** → **Discover Apps** → **Custom App** (top-right). Name it `bandcamp-warden`. Paste the contents of [`docker-compose.yaml`](./docker-compose.yaml) into the YAML editor. Important: **TrueNAS Custom Apps don't auto-load `.env` files** — you have two options:
 
@@ -123,7 +132,7 @@ In the TrueNAS UI: **Apps** → **Discover Apps** → **Custom App** (top-right)
 
 Click **Install**. The sidecar pulls its image from `ghcr.io/idleherb/bandcamp-warden-sidecar:latest`, starts up, and immediately sends `🟢 bandcamp-warden online` to your Telegram. If you don't see that message within ~30 seconds, something's wrong (see [troubleshooting](#troubleshooting)).
 
-### 6. First-run smoke test
+### 7. First-run smoke test
 
 Don't wait until 03:00 the next morning to find out if it works. From your Mac (or any LAN machine):
 
