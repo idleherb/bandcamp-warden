@@ -13,11 +13,13 @@ channel; the HTTP endpoints are for LAN-side spot-checks.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import sqlite3
 import threading
+import urllib.parse
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
@@ -385,6 +387,240 @@ class BandcampsyncController:
                     yield line
 
 
+# ---------- Metadata enricher ----------
+
+# Unambiguous mapping item_id → folder is built by parsing two bandcampsync
+# log line shapes in real time. This is far safer than reverse-engineering
+# bandcampsync's slug algorithm — we just record the path bandcampsync
+# actually wrote to, paired with the id from the preceding "New media item"
+# line. Per-album files are named bandcamp_<item_id>.json so even a freak
+# folder collision can't make two albums fight over one filename.
+
+NEW_ITEM_RE = re.compile(r'will download:.*?\(id:(\d+)\)')
+MOVE_FILE_RE = re.compile(r'Moving extracted file: ".+?" to "([^"]+)"')
+
+BANDCAMP_API_URL = "https://bandcamp.com/api/fancollection/1/collection_items"
+BANDCAMP_USER_AGENT = (
+    "bandcamp-warden/1.0 (+https://github.com/idleherb/bandcamp-warden)"
+)
+
+
+class MetadataEnricher:
+    """Captures item_id → folder during a run, then fetches Bandcamp Fan API
+    metadata at run-end and writes per-album JSON + a central JSONL index."""
+
+    def __init__(
+        self,
+        config_view: Path,
+        downloads_view: Path,
+        state_path: Path,
+        telegram: Telegram,
+    ) -> None:
+        self.config_view = config_view
+        self.downloads_view = downloads_view
+        self.index_path = state_path / "album_index.jsonl"
+        self.orphan_path = state_path / "orphaned_metadata.jsonl"
+        self.telegram = telegram
+        self._reset_run_state()
+
+    def _reset_run_state(self) -> None:
+        self.id_to_folder: dict[int, Path] = {}
+        self._current_id: int | None = None
+
+    def begin_run(self) -> None:
+        self._reset_run_state()
+
+    def observe_log(self, line: str) -> None:
+        """Hook for the orchestrator's log loop. Builds id→folder during the run."""
+        m = NEW_ITEM_RE.search(line)
+        if m:
+            self._current_id = int(m.group(1))
+            return
+        m = MOVE_FILE_RE.search(line)
+        if m and self._current_id is not None:
+            file_in_container = Path(m.group(1))
+            # bandcampsync's view: /downloads/<Artist>/<Album>/<file>
+            # Sidecar's view: same path inside its own /downloads mount.
+            try:
+                rel = file_in_container.relative_to("/downloads")
+            except ValueError:
+                # bandcampsync logged a path outside /downloads — shouldn't
+                # happen, but be defensive.
+                return
+            folder = self.downloads_view / rel.parent
+            self.id_to_folder[self._current_id] = folder
+
+    # ----- cookie + fan-id parsing -----
+
+    def _parse_identity_cookie(self) -> tuple[str | None, int | None]:
+        """Return (raw_value_for_cookie_header, fan_id) from cookies.txt."""
+        cookies = self.config_view / "cookies.txt"
+        if not cookies.exists():
+            return None, None
+        chosen_value: str | None = None
+        chosen_expiry = -1
+        for line in cookies.read_text(errors="replace").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 7:
+                continue
+            domain, _flag, _path, _secure, expires, name, value = parts[:7]
+            if name != "identity" or "bandcamp.com" not in domain:
+                continue
+            try:
+                exp = int(expires)
+            except ValueError:
+                continue
+            # Pick the longest-lived identity row if there are duplicates.
+            if exp > chosen_expiry:
+                chosen_expiry = exp
+                chosen_value = value
+        if not chosen_value:
+            return None, None
+        # The identity cookie value is URL-encoded and contains a JSON blob
+        # with the fan_id near the end: ...%7B%22id%22%3A2041125390%2C...%7D
+        decoded = urllib.parse.unquote(chosen_value)
+        m = re.search(r'\{[^{}]*"id"\s*:\s*(\d+)', decoded)
+        fan_id = int(m.group(1)) if m else None
+        return chosen_value, fan_id
+
+    # ----- Fan API -----
+
+    async def _fetch_collection(
+        self, fan_id: int, identity_value: str
+    ) -> dict[int, dict]:
+        """Page through the user's full Fan-API collection. Return {item_id: row}."""
+        out: dict[int, dict] = {}
+        token = "9999999999::a::"
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                try:
+                    r = await client.post(
+                        BANDCAMP_API_URL,
+                        json={
+                            "fan_id": fan_id,
+                            "older_than_token": token,
+                            "count": 100,
+                        },
+                        headers={
+                            "User-Agent": BANDCAMP_USER_AGENT,
+                            "Cookie": f"identity={identity_value}",
+                            "Accept": "application/json",
+                        },
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+                except Exception as e:
+                    log.warning("Fan API fetch failed: %s", e)
+                    break
+                items = data.get("items") or []
+                if not items:
+                    break
+                for it in items:
+                    iid = it.get("tralbum_id") or it.get("item_id")
+                    if iid is None:
+                        continue
+                    out[int(iid)] = it
+                if not data.get("more_available"):
+                    break
+                next_token = data.get("last_token")
+                if not next_token or next_token == token:
+                    break
+                token = next_token
+        return out
+
+    # ----- writing -----
+
+    @staticmethod
+    def _atomic_write(path: Path, payload: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _build_record(self, item_id: int, folder: Path, api_row: dict | None) -> dict:
+        rec = {
+            "item_id": item_id,
+            "folder": str(folder),
+            "downloaded_at": datetime.now(timezone.utc).isoformat(),
+            "downloaded_format": "flac",
+        }
+        if api_row:
+            for src, dst in (
+                ("band_name", "band_name"),
+                ("item_title", "item_title"),
+                ("item_url", "item_url"),
+                ("tralbum_type", "tralbum_type"),
+                ("release_date", "release_date"),
+                ("purchased", "purchased_at"),
+                ("added", "added_at"),
+                ("tralbum_genre", "genre"),
+                ("featured_track_title", "featured_track"),
+            ):
+                v = api_row.get(src)
+                if v is not None:
+                    rec[dst] = v
+        return rec
+
+    async def enrich_run(self) -> dict:
+        """Run after the daily monitor loop ends. Writes per-album JSON
+        for every item we observed this run, plus appends to the central
+        JSONL index. Returns counts for the run summary."""
+        seen = dict(self.id_to_folder)  # snapshot
+        if not seen:
+            return {"observed": 0, "written": 0, "orphaned": 0, "api": False}
+
+        identity_value, fan_id = self._parse_identity_cookie()
+        api_map: dict[int, dict] = {}
+        if identity_value and fan_id:
+            api_map = await self._fetch_collection(fan_id, identity_value)
+        else:
+            log.warning(
+                "Could not extract identity cookie or fan_id; "
+                "writing log-derived metadata only"
+            )
+
+        written = 0
+        orphaned = 0
+        for item_id, folder in seen.items():
+            api_row = api_map.get(item_id)
+            record = self._build_record(item_id, folder, api_row)
+
+            # Append to central index regardless of folder existence
+            try:
+                with self.index_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception as e:
+                log.error("Failed appending to album_index.jsonl: %s", e)
+
+            # Per-album file: only if folder exists; else log to orphan jsonl
+            if folder.exists() and folder.is_dir():
+                try:
+                    self._atomic_write(
+                        folder / f"bandcamp_{item_id}.json",
+                        json.dumps(record, ensure_ascii=False, indent=2),
+                    )
+                    written += 1
+                except Exception as e:
+                    log.error("Failed writing %s: %s", folder, e)
+            else:
+                orphaned += 1
+                try:
+                    with self.orphan_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                except Exception as e:
+                    log.error("Failed appending to orphaned_metadata.jsonl: %s", e)
+
+        return {
+            "observed": len(seen),
+            "written": written,
+            "orphaned": orphaned,
+            "api": bool(api_map),
+            "api_items": len(api_map),
+        }
+
+
 # ---------- Orchestrator ----------
 
 class Orchestrator:
@@ -395,12 +631,14 @@ class Orchestrator:
         telegram: Telegram,
         config_view: Path,
         settings: Settings,
+        enricher: MetadataEnricher,
     ) -> None:
         self.state = state
         self.controller = controller
         self.telegram = telegram
         self.config_view = config_view
         self.settings = settings
+        self.enricher = enricher
         self.log_buffer: deque[str] = deque(maxlen=settings.log_buffer_size)
         self._run_lock = asyncio.Lock()
         self._last_download_at: str | None = None
@@ -514,6 +752,7 @@ class Orchestrator:
             await self.telegram.send(f"❌ bandcampsync-Start fehlgeschlagen:\n```\n{e}\n```")
             return
 
+        self.enricher.begin_run()
         await self._monitor(run_date, baseline, quota, container)
 
     async def _monitor(self, run_date: str, baseline: int, quota: int, container) -> None:
@@ -535,12 +774,14 @@ class Orchestrator:
         stop_reason: str | None = None
         anomaly_hits = 0
         last_count = baseline
+        last_quota_check = 0.0
 
         # 24h hard cap on a single daily run so a stuck log stream can't pin us forever.
         deadline = loop.time() + 24 * 3600
 
         def check_quota() -> tuple[bool, int]:
-            nonlocal last_count
+            nonlocal last_count, last_quota_check
+            last_quota_check = loop.time()
             count = count_completed_albums(self.config_view)
             if count != last_count:
                 self._last_download_at = datetime.now(timezone.utc).isoformat()
@@ -556,9 +797,7 @@ class Orchestrator:
             try:
                 line = await asyncio.wait_for(line_queue.get(), timeout=30)
             except asyncio.TimeoutError:
-                # Periodic checks even if bandcampsync is quiet. The folder
-                # rglob is the only place we re-count, so it can't dominate
-                # CPU even on big trees.
+                # Periodic checks even if bandcampsync is quiet.
                 if not self.controller.is_running():
                     stop_reason = "exited"
                     break
@@ -574,6 +813,8 @@ class Orchestrator:
 
             self.log_buffer.append(line)
             recent.append(line)
+            # Real-time mapping for the metadata enricher.
+            self.enricher.observe_log(line)
 
             # Anomaly detection runs only on non-INFO lines so artist/album
             # names containing words like "forbidden" don't trigger false
@@ -584,12 +825,28 @@ class Orchestrator:
                     stop_reason = "emergency"
                     break
 
+            # Debounced quota check during active log flow — we want
+            # /status today_run.downloaded to track close to reality even
+            # when bandcampsync is chatty (one log line per ~5–30 s during
+            # a download). 5 s is well below the per-album time and well
+            # above the cost of reading ignores.txt.
+            if loop.time() - last_quota_check >= 5.0:
+                hit, _ = check_quota()
+                if hit:
+                    stop_reason = "quota_hit"
+                    break
+
         # Make sure bandcampsync is actually stopped.
         self.controller.stop()
         final = count_completed_albums(self.config_view)
         downloaded_today = final - baseline
         finished_at = datetime.now(timezone.utc).isoformat()
 
+        # Decide branch: build the user-facing message, persist run state.
+        # We do NOT send Telegram or return yet — enrichment is appended to
+        # the message so the user sees the metadata-write summary in the
+        # same notification.
+        msg: str
         if stop_reason == "emergency":
             recent_tail = "\n".join(list(recent)[-6:])
             self.state.update(
@@ -606,7 +863,7 @@ class Orchestrator:
                 stop_reason=f"{anomaly_hits} anomalies",
                 finished_at=finished_at,
             )
-            await self.telegram.send(
+            msg = (
                 "🚨 *NOTBREMSE*\n"
                 f"`{anomaly_hits}` Auth-/Rate-Fehler in den letzten "
                 f"{self.settings.anomaly_window} Log-Zeilen.\n"
@@ -615,9 +872,7 @@ class Orchestrator:
                 f"Letzte Zeilen:\n```\n{recent_tail[:800]}\n```\n\n"
                 "Bitte prüfen, dann `POST /reset-emergency` am Sidecar."
             )
-            return
-
-        if stop_reason == "quota_hit":
+        elif stop_reason == "quota_hit":
             self.state.update_run(
                 run_date,
                 downloaded=downloaded_today,
@@ -625,14 +880,12 @@ class Orchestrator:
                 stop_reason="daily quota reached",
                 finished_at=finished_at,
             )
-            await self.telegram.send(
+            msg = (
                 f"✅ *Tag fertig* (`{run_date}`)\n"
                 f"Heute: *{downloaded_today}*/{quota}\n"
                 f"Gesamt: *{final}*"
             )
-            return
-
-        if stop_reason == "deadline":
+        elif stop_reason == "deadline":
             self.state.update_run(
                 run_date,
                 downloaded=downloaded_today,
@@ -640,50 +893,69 @@ class Orchestrator:
                 stop_reason="24h deadline hit",
                 finished_at=finished_at,
             )
-            await self.telegram.send(
+            msg = (
                 "⌛ *24h-Deadline erreicht*\n"
                 f"Heute: *{downloaded_today}*/{quota}, Gesamt: *{final}*.\n"
                 "Run war ungewöhnlich lang. Bitte `/logs` prüfen."
             )
-            return
-
-        # bandcampsync exited on its own. Two interpretations: collection done,
-        # or a hard error. If we made progress and there are no recent anomalies
-        # in the buffer, assume done. Otherwise flag.
-        had_anomaly = any(is_anomaly_line(ln) for ln in recent)
-        if downloaded_today > 0 and not had_anomaly:
-            self.state.update_run(
-                run_date,
-                downloaded=downloaded_today,
-                status="completed",
-                stop_reason="bandcampsync exited (likely caught up)",
-                finished_at=finished_at,
-            )
-            self.state.update(collection_complete=1 if downloaded_today < quota else 0)
-            msg = (
-                "🎉 *Collection vollständig*\n"
-                f"bandcampsync hat sich beendet, keine ausstehenden Alben mehr.\n"
-                f"Gesamt: *{final}*"
-                if downloaded_today < quota
-                else f"✅ *Tag fertig* (`{run_date}`)\n"
-                f"bandcampsync hat exakt die Quota geliefert: *{downloaded_today}*/{quota}\n"
-                f"Gesamt: *{final}*"
-            )
-            await self.telegram.send(msg)
         else:
-            self.state.update_run(
-                run_date,
-                downloaded=downloaded_today,
-                status="completed",
-                stop_reason="bandcampsync exited unexpectedly",
-                finished_at=finished_at,
+            # bandcampsync exited on its own. Two interpretations: collection
+            # done, or a hard error. If we made progress and there are no
+            # recent anomalies in the buffer, assume done.
+            had_anomaly = any(is_anomaly_line(ln) for ln in recent)
+            if downloaded_today > 0 and not had_anomaly:
+                self.state.update_run(
+                    run_date,
+                    downloaded=downloaded_today,
+                    status="completed",
+                    stop_reason="bandcampsync exited (likely caught up)",
+                    finished_at=finished_at,
+                )
+                self.state.update(collection_complete=1 if downloaded_today < quota else 0)
+                msg = (
+                    "🎉 *Collection vollständig*\n"
+                    f"bandcampsync hat sich beendet, keine ausstehenden Alben mehr.\n"
+                    f"Gesamt: *{final}*"
+                    if downloaded_today < quota
+                    else f"✅ *Tag fertig* (`{run_date}`)\n"
+                    f"bandcampsync hat exakt die Quota geliefert: *{downloaded_today}*/{quota}\n"
+                    f"Gesamt: *{final}*"
+                )
+            else:
+                self.state.update_run(
+                    run_date,
+                    downloaded=downloaded_today,
+                    status="completed",
+                    stop_reason="bandcampsync exited unexpectedly",
+                    finished_at=finished_at,
+                )
+                recent_tail = "\n".join(list(recent)[-6:])
+                msg = (
+                    "⚠️ *bandcampsync hat unerwartet beendet*\n"
+                    f"Heute: *{downloaded_today}*/{quota}, Gesamt: *{final}*.\n"
+                    f"Letzte Zeilen:\n```\n{recent_tail[:800]}\n```"
+                )
+
+        # Enrich whatever we managed to download this run, and append the
+        # summary to the Telegram message. Failures are logged but never
+        # block the user-visible notification.
+        try:
+            er = await self.enricher.enrich_run()
+        except Exception as e:
+            log.exception("Enrichment failed")
+            er = {"observed": 0, "written": 0, "orphaned": 0, "api": False, "error": str(e)}
+
+        if er.get("observed"):
+            api_note = "API ✓" if er.get("api") else "API ✗ (log-derived only)"
+            orphan_note = (
+                f", *{er['orphaned']}* orphaned" if er.get("orphaned") else ""
             )
-            recent_tail = "\n".join(list(recent)[-6:])
-            await self.telegram.send(
-                "⚠️ *bandcampsync hat unerwartet beendet*\n"
-                f"Heute: *{downloaded_today}*/{quota}, Gesamt: *{final}*.\n"
-                f"Letzte Zeilen:\n```\n{recent_tail[:800]}\n```"
+            msg += (
+                f"\n\n📋 Metadaten: *{er['written']}*/{er['observed']} geschrieben"
+                f"{orphan_note} ({api_note})"
             )
+
+        await self.telegram.send(msg)
 
     def status(self) -> dict:
         s = self.state.get()
@@ -714,8 +986,14 @@ class Orchestrator:
 state = State(Path(settings.state_path) / "state.db")
 controller = BandcampsyncController(settings)
 telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
+enricher = MetadataEnricher(
+    config_view=Path(settings.config_view_path),
+    downloads_view=Path(settings.downloads_view_path),
+    state_path=Path(settings.state_path),
+    telegram=telegram,
+)
 orchestrator = Orchestrator(
-    state, controller, telegram, Path(settings.config_view_path), settings
+    state, controller, telegram, Path(settings.config_view_path), settings, enricher,
 )
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 

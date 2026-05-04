@@ -50,12 +50,14 @@ services:
       # process). Lives on the apps pool.
       - ${HOST_STATE_PATH:-/mnt/apps/bandcamp-warden/state}:/state
 
-      # Read-only view of the music output, used to count completed albums
-      # via the bandcamp_item_id.txt markers.
-      - ${HOST_DOWNLOADS_PATH:-/mnt/storage/media/bandcamp}:/downloads:ro
+      # Music output. Sidecar needs RW so the metadata enricher can write
+      # bandcamp_<item_id>.json files into each album folder; bandcampsync
+      # writes the FLACs themselves under the same mount.
+      - ${HOST_DOWNLOADS_PATH:-/mnt/storage/media/bandcamp}:/downloads
 
       # Read-only view of bandcampsync's config dir so the sidecar can parse
-      # cookies.txt and warn before the identity cookie expires.
+      # cookies.txt (for expiry monitoring + extracting fan_id for the
+      # Bandcamp Fan API) and ignores.txt (for the completion counter).
       - ${HOST_CONFIG_PATH:-/mnt/apps/bandcamp-warden/config}:/config:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=3).status==200 else 1)"]
