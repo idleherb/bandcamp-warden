@@ -587,108 +587,45 @@ class MetadataEnricher:
             self._fetch_collection_sync, fan_id, cookie_jar
         )
 
-    @staticmethod
     def _fetch_collection_sync(
-        fan_id: int, cookie_jar: dict[str, str]
+        self, fan_id: int, cookie_jar: dict[str, str]
     ) -> dict[int, dict]:
-        """Fetch the user's full Fan-API collection.
+        """Use bandcampsync's own Bandcamp client. It handles auth, TLS
+        impersonation, cookie-jar plumbing, paginated load, and item
+        de-duplication. fan_id and cookie_jar args are unused now (kept
+        for signature compat) — bandcampsync extracts both from the
+        cookies.txt content directly."""
+        from bandcampsync.bandcamp import Bandcamp, BandcampError  # type: ignore
 
-        Bandcamp's Fan API returns 0 items unless we (a) prime the
-        server-side session via a homepage GET and (b) send the cookie
-        jar explicitly with each request. session.cookies.set(...) was
-        not being honoured by curl_cffi the way the per-request cookies
-        kwarg is, so the API saw us as an anonymous visitor with 0
-        purchases. bandcampsync uses the same per-request pattern.
-        """
+        cookies_path = self.config_view / "cookies.txt"
+        if not cookies_path.exists():
+            log.warning("Fan API: cookies.txt missing at %s", cookies_path)
+            return {}
+        cookies_str = cookies_path.read_text(errors="replace")
+        try:
+            bc = Bandcamp(cookies_str)
+            bc.load_pagedata()
+            bc.load_purchases()
+        except BandcampError as e:
+            log.warning("Fan API (bandcampsync): %s", e)
+            return {}
+        except Exception as e:
+            log.exception("Fan API (bandcampsync) raised %s", type(e).__name__)
+            return {}
+
         out: dict[int, dict] = {}
-        now_ts = int(datetime.now(timezone.utc).timestamp())
-        token = f"{now_ts}:0:a::"
-
-        with curl_requests.Session(impersonate="chrome") as session:
-            # Pre-flight: prime the server-side session. Cookies are
-            # passed per-request because that's what bandcampsync does
-            # and what curl_cffi reliably forwards.
-            try:
-                r = session.get(
-                    "https://bandcamp.com/",
-                    cookies=cookie_jar,
-                    timeout=30,
-                )
-                log.info(
-                    "Fan API pre-flight GET / → HTTP %s, %d bytes",
-                    r.status_code, len(r.content or b""),
-                )
-                # Sanity check that the server recognised our session: the
-                # homepage's pagedata blob contains pageContext.identity.id
-                # only for authenticated requests. If it's missing, future
-                # API calls will return empty.
-                m = re.search(
-                    r'"identity"\s*:\s*\{[^{}]*"id"\s*:\s*(\d+)',
-                    r.text or "",
-                )
-                if m:
-                    log.info(
-                        "Fan API pre-flight: server recognised fan_id=%s",
-                        m.group(1),
-                    )
-                else:
-                    log.warning(
-                        "Fan API pre-flight: server returned anonymous "
-                        "page (no fan_id in HTML). API will return 0 items."
-                    )
-            except Exception as e:
-                log.warning("Fan API pre-flight failed: %s", e)
-
-            for page in range(100):
-                try:
-                    r = session.post(
-                        BANDCAMP_API_URL,
-                        json={
-                            "fan_id": fan_id,
-                            "older_than_token": token,
-                            "count": 100,
-                        },
-                        cookies=cookie_jar,
-                        headers={
-                            "Origin": "https://bandcamp.com",
-                            "Referer": "https://bandcamp.com/",
-                        },
-                        timeout=30,
-                    )
-                except Exception as e:
-                    log.warning("Fan API request raised: %s", e)
-                    break
-                if r.status_code != 200:
-                    body = (r.text or "")[:200]
-                    log.warning(
-                        "Fan API page %d → HTTP %s, body: %r",
-                        page, r.status_code, body,
-                    )
-                    break
-                try:
-                    data = r.json()
-                except Exception as e:
-                    log.warning("Fan API page %d JSON decode failed: %s", page, e)
-                    break
-                items = data.get("items") or []
-                if not items:
-                    log.info(
-                        "Fan API page %d: 0 items (more_available=%s, keys=%s)",
-                        page, data.get("more_available"), list(data.keys())[:6],
-                    )
-                    break
-                for it in items:
-                    iid = it.get("tralbum_id") or it.get("item_id")
-                    if iid is None:
-                        continue
-                    out[int(iid)] = it
-                if not data.get("more_available"):
-                    break
-                next_token = data.get("last_token")
-                if not next_token or next_token == token:
-                    break
-                token = next_token
-        log.info("Fan API: collected %d items total", len(out))
+        for purchase in getattr(bc, "purchases", []) or []:
+            data = getattr(purchase, "_data", None)
+            if not isinstance(data, dict):
+                continue
+            iid = data.get("item_id") or data.get("tralbum_id")
+            if iid is None:
+                continue
+            out[int(iid)] = data
+        log.info(
+            "Fan API: collected %d items via bandcampsync (user_id=%s)",
+            len(out), getattr(bc, "user_id", None),
+        )
         return out
 
     # ----- writing -----

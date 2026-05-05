@@ -4,7 +4,8 @@ pydantic-settings==2.7.1
 docker==7.1.0
 httpx==0.28.1
 apscheduler==3.10.4
-# Bandcamp's Fan API gates non-Chrome TLS fingerprints. curl_cffi fakes
-# a Chrome TLS handshake so our request looks like the real browser —
-# same trick bandcampsync itself uses internally.
-curl_cffi==0.7.4
+# bandcampsync handles all the Fan API auth and pagination — TLS
+# impersonation, session cookie handling, paged collection load,
+# de-duplication. We use the same library the bandcampsync container
+# uses, so identical behaviour. curl_cffi comes in transitively.
+bandcampsync==0.7.0
