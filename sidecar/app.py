@@ -593,39 +593,51 @@ class MetadataEnricher:
     ) -> dict[int, dict]:
         """Fetch the user's full Fan-API collection.
 
-        Bandcamp's Fan API returns 0 items if the request hits the API
-        directly without first establishing a session via the homepage.
-        bandcampsync replicates this with load_pagedata() before any API
-        call. We do the same: a single GET to https://bandcamp.com/ on
-        the same curl_cffi Session priming the server-side session
-        bookkeeping. Without this step we get HTTP 200 + empty results.
+        Bandcamp's Fan API returns 0 items unless we (a) prime the
+        server-side session via a homepage GET and (b) send the cookie
+        jar explicitly with each request. session.cookies.set(...) was
+        not being honoured by curl_cffi the way the per-request cookies
+        kwarg is, so the API saw us as an anonymous visitor with 0
+        purchases. bandcampsync uses the same per-request pattern.
         """
         out: dict[int, dict] = {}
         now_ts = int(datetime.now(timezone.utc).timestamp())
         token = f"{now_ts}:0:a::"
 
         with curl_requests.Session(impersonate="chrome") as session:
-            # Seed the session with our auth cookies so they're sent on
-            # every request the session makes.
-            for k, v in cookie_jar.items():
-                session.cookies.set(k, v, domain=".bandcamp.com")
-
-            # Pre-flight: prime the server-side session.
+            # Pre-flight: prime the server-side session. Cookies are
+            # passed per-request because that's what bandcampsync does
+            # and what curl_cffi reliably forwards.
             try:
-                r = session.get("https://bandcamp.com/", timeout=30)
+                r = session.get(
+                    "https://bandcamp.com/",
+                    cookies=cookie_jar,
+                    timeout=30,
+                )
                 log.info(
                     "Fan API pre-flight GET / → HTTP %s, %d bytes",
                     r.status_code, len(r.content or b""),
                 )
-                if r.status_code != 200:
+                # Sanity check that the server recognised our session: the
+                # homepage's pagedata blob contains pageContext.identity.id
+                # only for authenticated requests. If it's missing, future
+                # API calls will return empty.
+                m = re.search(
+                    r'"identity"\s*:\s*\{[^{}]*"id"\s*:\s*(\d+)',
+                    r.text or "",
+                )
+                if m:
+                    log.info(
+                        "Fan API pre-flight: server recognised fan_id=%s",
+                        m.group(1),
+                    )
+                else:
                     log.warning(
-                        "Fan API pre-flight non-200 (%s); proceeding anyway",
-                        r.status_code,
+                        "Fan API pre-flight: server returned anonymous "
+                        "page (no fan_id in HTML). API will return 0 items."
                     )
             except Exception as e:
                 log.warning("Fan API pre-flight failed: %s", e)
-                # Don't bail — try the API call anyway, the failure mode
-                # just becomes the same as before this fix.
 
             for page in range(100):
                 try:
@@ -635,6 +647,11 @@ class MetadataEnricher:
                             "fan_id": fan_id,
                             "older_than_token": token,
                             "count": 100,
+                        },
+                        cookies=cookie_jar,
+                        headers={
+                            "Origin": "https://bandcamp.com",
+                            "Referer": "https://bandcamp.com/",
                         },
                         timeout=30,
                     )
@@ -1505,15 +1522,11 @@ async def diagnose_fan_api() -> dict:
             result["raised_session"] = f"{type(e).__name__}: {e}"
             return result
 
-        try:
-            for k, v in cookie_jar.items():
-                session.cookies.set(k, v, domain=".bandcamp.com")
-        except Exception as e:
-            result["raised_cookie_set"] = f"{type(e).__name__}: {e}"
-
         # ----- pre-flight -----
         try:
-            pf = session.get("https://bandcamp.com/", timeout=30)
+            pf = session.get(
+                "https://bandcamp.com/", cookies=cookie_jar, timeout=30
+            )
             result["preflight"]["status"] = pf.status_code
             result["preflight"]["body_bytes"] = len(pf.content or b"")
             result["preflight"]["set_cookie_names"] = _safe_cookie_names(
@@ -1551,6 +1564,7 @@ async def diagnose_fan_api() -> dict:
                     "older_than_token": token,
                     "count": 100,
                 },
+                cookies=cookie_jar,
                 headers={
                     "Origin": "https://bandcamp.com",
                     "Referer": "https://bandcamp.com/",
