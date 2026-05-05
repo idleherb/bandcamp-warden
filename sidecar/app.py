@@ -1459,6 +1459,36 @@ async def reset_completion() -> dict:
     return {"reset": True}
 
 
+@app.get("/sample-metadata")
+async def sample_metadata(count: int = 5) -> dict:
+    """Read up to N bandcamp_<id>.json files from /downloads and return
+    their parsed content. Lets us verify backfill quality without shell
+    access — what fields are present, what fields are null."""
+    samples: list[dict] = []
+    field_coverage: dict[str, int] = {}
+    n = max(1, min(count, 50))
+    base = Path(settings.downloads_view_path)
+    if base.exists():
+        for path in base.rglob("bandcamp_*.json"):
+            try:
+                content = json.loads(path.read_text(encoding="utf-8"))
+                if len(samples) < n:
+                    samples.append({
+                        "path": str(path),
+                        "content": content,
+                    })
+                for k in content.keys():
+                    field_coverage[k] = field_coverage.get(k, 0) + 1
+            except Exception as e:
+                if len(samples) < n:
+                    samples.append({"path": str(path), "error": str(e)})
+    return {
+        "files_total": sum(field_coverage.values()) // (len(field_coverage) or 1),
+        "field_coverage": dict(sorted(field_coverage.items(), key=lambda kv: -kv[1])),
+        "samples": samples,
+    }
+
+
 @app.post("/backfill-metadata")
 async def backfill_metadata(force: bool = False) -> dict:
     """Walk the existing /downloads tree and write bandcamp_<id>.json for
