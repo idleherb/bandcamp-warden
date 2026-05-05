@@ -26,6 +26,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+import curl_cffi.requests as curl_requests
 import docker
 import docker.errors
 import httpx
@@ -533,26 +534,46 @@ class MetadataEnricher:
     async def _fetch_collection(
         self, fan_id: int, identity_value: str
     ) -> dict[int, dict]:
-        """Page through the user's full Fan-API collection. Return {item_id: row}."""
+        """Page through the user's full Fan-API collection. Return {item_id: row}.
+
+        Bandcamp's Fan API gates non-Chrome TLS fingerprints; standard httpx
+        gets blocked silently. curl_cffi.Session(impersonate="chrome") spoofs
+        a real Chrome handshake — same library bandcampsync uses, so
+        equivalent behaviour. We run the synchronous session in a thread
+        because curl_cffi has an asyncio mode but it's less battle-tested
+        and we only call this once per daily run.
+        """
+        return await asyncio.to_thread(
+            self._fetch_collection_sync, fan_id, identity_value
+        )
+
+    @staticmethod
+    def _fetch_collection_sync(fan_id: int, identity_value: str) -> dict[int, dict]:
         out: dict[int, dict] = {}
-        token = "9999999999::a::"
-        async with httpx.AsyncClient(timeout=30) as client:
-            while True:
+        # Match bandcampsync's token format exactly: "<unix_ts>:<page_ts>:a::"
+        # — bandcamp expects exactly four colons and treats the first as a
+        # current-time anchor.
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        token = f"{now_ts}:0:a::"
+        with curl_requests.Session(impersonate="chrome") as session:
+            for _ in range(100):  # hard cap on pagination loop
                 try:
-                    r = await client.post(
+                    r = session.post(
                         BANDCAMP_API_URL,
                         json={
                             "fan_id": fan_id,
                             "older_than_token": token,
                             "count": 100,
                         },
-                        headers={
-                            "User-Agent": BANDCAMP_USER_AGENT,
-                            "Cookie": f"identity={identity_value}",
-                            "Accept": "application/json",
-                        },
+                        cookies={"identity": identity_value},
+                        timeout=30,
                     )
-                    r.raise_for_status()
+                    if r.status_code != 200:
+                        log.warning(
+                            "Fan API returned HTTP %s; aborting pagination at %d items",
+                            r.status_code, len(out),
+                        )
+                        break
                     data = r.json()
                 except Exception as e:
                     log.warning("Fan API fetch failed: %s", e)
@@ -571,6 +592,7 @@ class MetadataEnricher:
                 if not next_token or next_token == token:
                     break
                 token = next_token
+        log.info("Fan API: collected %d items", len(out))
         return out
 
     # ----- writing -----
@@ -666,6 +688,77 @@ class MetadataEnricher:
             "orphaned": orphaned,
             "api": bool(api_map),
             "api_items": len(api_map),
+        }
+
+    async def backfill(self, only_missing: bool = True) -> dict:
+        """Walk the existing /downloads tree, find every album folder, and
+        write or refresh its bandcamp_<id>.json. The folder→item_id mapping
+        comes from looking up each folder against the Fan API's item_url
+        (which encodes the slug bandcampsync uses) — but easier: bandcampsync
+        already wrote each ID into /config/ignores.txt in download order,
+        so we cross-reference with the Fan API and try to match by
+        (band_name slug, item_title slug) to actual folder paths.
+
+        only_missing: if True, skip folders that already have a bandcamp_*.json.
+        """
+        identity_value, fan_id = self._parse_identity_cookie()
+        if not identity_value or not fan_id:
+            return {"error": "could not parse identity cookie / fan_id", "written": 0}
+        api_map = await self._fetch_collection(fan_id, identity_value)
+        if not api_map:
+            return {"error": "Fan API returned no items", "written": 0}
+
+        # Index existing album folders by their basename (Album title) and
+        # parent name (Artist). This is best-effort matching and may miss
+        # albums whose folder name differs from the API title due to
+        # bandcampsync's sanitization. Those land in orphaned_metadata.
+        existing_folders: list[Path] = []
+        if self.downloads_view.exists():
+            for artist_dir in self.downloads_view.iterdir():
+                if not artist_dir.is_dir():
+                    continue
+                for album_dir in artist_dir.iterdir():
+                    if album_dir.is_dir():
+                        existing_folders.append(album_dir)
+
+        # Build artist+title → folder map. Sanitize roughly the same way
+        # bandcampsync does (forward-slash to dash, common replacements).
+        def normalize(s: str) -> str:
+            return (s or "").lower().strip().replace("/", "-").replace(":", "-")
+
+        folder_map: dict[tuple[str, str], Path] = {}
+        for f in existing_folders:
+            folder_map[(normalize(f.parent.name), normalize(f.name))] = f
+
+        written = 0
+        skipped = 0
+        unmatched = 0
+        for item_id, api_row in api_map.items():
+            band_key = normalize(api_row.get("band_name", ""))
+            title_key = normalize(api_row.get("item_title", ""))
+            folder = folder_map.get((band_key, title_key))
+            if folder is None:
+                unmatched += 1
+                continue
+            target = folder / f"bandcamp_{item_id}.json"
+            if only_missing and target.exists():
+                skipped += 1
+                continue
+            record = self._build_record(item_id, folder, api_row)
+            try:
+                self._atomic_write(
+                    target,
+                    json.dumps(record, ensure_ascii=False, indent=2),
+                )
+                written += 1
+            except Exception as e:
+                log.error("Backfill write failed for %s: %s", target, e)
+        return {
+            "api_items": len(api_map),
+            "existing_folders": len(existing_folders),
+            "written": written,
+            "skipped_already_present": skipped,
+            "unmatched": unmatched,
         }
 
 
@@ -1258,3 +1351,15 @@ async def reset_completion() -> dict:
     'caught up'."""
     state.update(collection_complete=0)
     return {"reset": True}
+
+
+@app.post("/backfill-metadata")
+async def backfill_metadata(force: bool = False) -> dict:
+    """Walk the existing /downloads tree and write bandcamp_<id>.json for
+    every album folder that doesn't already have one. Pulls fresh data
+    from the Bandcamp Fan API. Use force=true to overwrite existing
+    metadata files (e.g. after upgrading what fields we capture).
+
+    Run this manually after the Fan API was unreachable during a daily
+    run, or after deploying a sidecar version with new fields."""
+    return await orchestrator.enricher.backfill(only_missing=not force)

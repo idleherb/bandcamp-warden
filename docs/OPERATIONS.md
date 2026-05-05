@@ -124,6 +124,13 @@ curl -X POST http://homeserver:31080/reset-completion
 
 # Force a cookie check now (bypasses once-per-day debounce)
 curl -X POST http://homeserver:31080/check-cookie
+
+# Backfill metadata for every album folder that lacks bandcamp_<id>.json.
+# Run this once after a sidecar upgrade or after a daily run failed to
+# reach the Fan API. Add ?force=true to overwrite existing metadata files
+# (use when new fields are added to the schema).
+curl -X POST 'http://homeserver:31080/backfill-metadata'
+curl -X POST 'http://homeserver:31080/backfill-metadata?force=true'
 ```
 
 ## Auto-retry on bandcampsync crashes
