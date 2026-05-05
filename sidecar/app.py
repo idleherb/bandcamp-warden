@@ -758,18 +758,26 @@ class MetadataEnricher:
                     if album_dir.is_dir():
                         existing_folders.append(album_dir)
 
-        # Step 2: aggressive normalization. Bandcampsync's folder
-        # sanitization replaces `/` and `:` with `-`, collapses
-        # whitespace, drops trailing dots/spaces, and strips a few
-        # other filesystem-hostile chars. We match the same way so the
-        # API titles line up with on-disk folder names.
-        _strip_chars = '*?"<>|\\\t\n\r\x00'
-        _strip_table = str.maketrans({c: "" for c in _strip_chars})
+        # Step 2: replicate bandcampsync's folder sanitization exactly.
+        # See bandcampsync/media.py LocalMedia._clean_path: NFKD-normalize
+        # (turns Math-Bold/fullwidth/combining chars into plain ASCII)
+        # then drop this exact set of punctuation chars. Whitespace
+        # collapsing + lowercase + trim are our addition to absorb tiny
+        # case/spacing drift between API titles and folder names.
+        import unicodedata
+
+        _bandcampsync_disallowed = '"#%\'*/?\\`:'
 
         def normalize(s: str) -> str:
-            s = (s or "").translate(_strip_table)
-            s = s.replace("/", "-").replace(":", "-")
-            # Collapse whitespace runs, lower, strip terminal dots/spaces.
+            s = unicodedata.normalize("NFKD", s or "")
+            # Drop format-category chars (zero-width spaces, joiners, etc.)
+            # and combining marks. NFKD splits accented letters into base
+            # + combining; we keep the base for matching purposes.
+            s = "".join(
+                c for c in s
+                if c not in _bandcampsync_disallowed
+                and unicodedata.category(c) not in ("Cf", "Mn")
+            )
             s = re.sub(r"\s+", " ", s).strip().rstrip(". ").lower()
             return s
 
