@@ -101,6 +101,24 @@ logging.basicConfig(
 )
 log = logging.getLogger("warden")
 
+# httpx INFO logs print the full request URL on every call. That includes
+# the Telegram bot token in the path. Mute it — we still get failure
+# details from the response handling in Telegram.send().
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+class _NoHealthzFilter(logging.Filter):
+    """Drop uvicorn access records for /healthz (and the docker healthcheck
+    that hits localhost). The healthcheck runs every 30s and floods the
+    log with no useful information."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "/healthz" not in msg
+
+
+logging.getLogger("uvicorn.access").addFilter(_NoHealthzFilter())
+
 
 # ---------- Patterns ----------
 
@@ -549,12 +567,43 @@ class MetadataEnricher:
     def _fetch_collection_sync(
         fan_id: int, cookie_jar: dict[str, str]
     ) -> dict[int, dict]:
+        """Fetch the user's full Fan-API collection.
+
+        Bandcamp's Fan API returns 0 items if the request hits the API
+        directly without first establishing a session via the homepage.
+        bandcampsync replicates this with load_pagedata() before any API
+        call. We do the same: a single GET to https://bandcamp.com/ on
+        the same curl_cffi Session priming the server-side session
+        bookkeeping. Without this step we get HTTP 200 + empty results.
+        """
         out: dict[int, dict] = {}
-        # bandcampsync's token format: "<unix_ts>:<page_ts>:a::"
         now_ts = int(datetime.now(timezone.utc).timestamp())
         token = f"{now_ts}:0:a::"
+
         with curl_requests.Session(impersonate="chrome") as session:
-            for page in range(100):  # hard cap on pagination
+            # Seed the session with our auth cookies so they're sent on
+            # every request the session makes.
+            for k, v in cookie_jar.items():
+                session.cookies.set(k, v, domain=".bandcamp.com")
+
+            # Pre-flight: prime the server-side session.
+            try:
+                r = session.get("https://bandcamp.com/", timeout=30)
+                log.info(
+                    "Fan API pre-flight GET / → HTTP %s, %d bytes",
+                    r.status_code, len(r.content or b""),
+                )
+                if r.status_code != 200:
+                    log.warning(
+                        "Fan API pre-flight non-200 (%s); proceeding anyway",
+                        r.status_code,
+                    )
+            except Exception as e:
+                log.warning("Fan API pre-flight failed: %s", e)
+                # Don't bail — try the API call anyway, the failure mode
+                # just becomes the same as before this fix.
+
+            for page in range(100):
                 try:
                     r = session.post(
                         BANDCAMP_API_URL,
@@ -563,7 +612,6 @@ class MetadataEnricher:
                             "older_than_token": token,
                             "count": 100,
                         },
-                        cookies=cookie_jar,
                         timeout=30,
                     )
                 except Exception as e:
