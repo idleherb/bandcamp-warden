@@ -748,10 +748,7 @@ class MetadataEnricher:
                 "cookie_count": len(cookie_jar),
             }
 
-        # Index existing album folders by their basename (Album title) and
-        # parent name (Artist). This is best-effort matching and may miss
-        # albums whose folder name differs from the API title due to
-        # bandcampsync's sanitization. Those land in orphaned_metadata.
+        # Step 1: index existing album folders.
         existing_folders: list[Path] = []
         if self.downloads_view.exists():
             for artist_dir in self.downloads_view.iterdir():
@@ -761,24 +758,73 @@ class MetadataEnricher:
                     if album_dir.is_dir():
                         existing_folders.append(album_dir)
 
-        # Build artist+title → folder map. Sanitize roughly the same way
-        # bandcampsync does (forward-slash to dash, common replacements).
-        def normalize(s: str) -> str:
-            return (s or "").lower().strip().replace("/", "-").replace(":", "-")
+        # Step 2: aggressive normalization. Bandcampsync's folder
+        # sanitization replaces `/` and `:` with `-`, collapses
+        # whitespace, drops trailing dots/spaces, and strips a few
+        # other filesystem-hostile chars. We match the same way so the
+        # API titles line up with on-disk folder names.
+        _strip_chars = '*?"<>|\\\t\n\r\x00'
+        _strip_table = str.maketrans({c: "" for c in _strip_chars})
 
-        folder_map: dict[tuple[str, str], Path] = {}
+        def normalize(s: str) -> str:
+            s = (s or "").translate(_strip_table)
+            s = s.replace("/", "-").replace(":", "-")
+            # Collapse whitespace runs, lower, strip terminal dots/spaces.
+            s = re.sub(r"\s+", " ", s).strip().rstrip(". ").lower()
+            return s
+
+        # Step 3: build matching indexes. (band, title) is best, then a
+        # title-only fallback for cases where bandcampsync collapsed an
+        # exotic artist name differently from the API.
+        folder_by_band_title: dict[tuple[str, str], Path] = {}
+        folder_by_title: dict[str, list[Path]] = {}
         for f in existing_folders:
-            folder_map[(normalize(f.parent.name), normalize(f.name))] = f
+            folder_by_band_title[(normalize(f.parent.name), normalize(f.name))] = f
+            folder_by_title.setdefault(normalize(f.name), []).append(f)
+
+        # Step 4: prefer items in ignores.txt — those are provably the
+        # ones bandcampsync downloaded. Falling back to all api_map keeps
+        # behaviour sane if ignores.txt is missing.
+        downloaded_ids: set[int] | None = None
+        ignores_path = self.config_view / "ignores.txt"
+        if ignores_path.exists():
+            ids: set[int] = set()
+            for line in ignores_path.read_text(errors="replace").splitlines():
+                stripped = line.split("#", 1)[0].strip()
+                if stripped.isdigit():
+                    ids.add(int(stripped))
+            if ids:
+                downloaded_ids = ids
+
+        candidates = (
+            {iid: api_map[iid] for iid in downloaded_ids if iid in api_map}
+            if downloaded_ids
+            else api_map
+        )
 
         written = 0
         skipped = 0
-        unmatched = 0
-        for item_id, api_row in api_map.items():
-            band_key = normalize(api_row.get("band_name", ""))
-            title_key = normalize(api_row.get("item_title", ""))
-            folder = folder_map.get((band_key, title_key))
+        unmatched_items: list[dict] = []
+        for item_id, api_row in candidates.items():
+            band = api_row.get("band_name", "")
+            title = api_row.get("item_title", "")
+            band_n = normalize(band)
+            title_n = normalize(title)
+            folder = folder_by_band_title.get((band_n, title_n))
             if folder is None:
-                unmatched += 1
+                # Title-only fallback (avoid ambiguous matches).
+                hits = folder_by_title.get(title_n) or []
+                if len(hits) == 1:
+                    folder = hits[0]
+            if folder is None:
+                if len(unmatched_items) < 50:
+                    unmatched_items.append({
+                        "item_id": item_id,
+                        "band_name": band,
+                        "item_title": title,
+                        "expected_band_norm": band_n,
+                        "expected_title_norm": title_n,
+                    })
                 continue
             target = folder / f"bandcamp_{item_id}.json"
             if only_missing and target.exists():
@@ -795,10 +841,13 @@ class MetadataEnricher:
                 log.error("Backfill write failed for %s: %s", target, e)
         return {
             "api_items": len(api_map),
+            "ignores_ids": len(downloaded_ids) if downloaded_ids else None,
+            "candidates": len(candidates),
             "existing_folders": len(existing_folders),
             "written": written,
             "skipped_already_present": skipped,
-            "unmatched": unmatched,
+            "unmatched_count": len(unmatched_items),
+            "unmatched_examples": unmatched_items,
         }
 
 
