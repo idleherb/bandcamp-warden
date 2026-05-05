@@ -1458,12 +1458,34 @@ async def backfill_metadata(force: bool = False) -> dict:
     return await orchestrator.enricher.backfill(only_missing=not force)
 
 
+def _safe_cookie_names(cookies_obj) -> list[str]:
+    """curl_cffi's cookie iterators can yield strings or Cookie objects
+    depending on the version; both shapes appear in the wild. Be defensive."""
+    out: list[str] = []
+    try:
+        for c in cookies_obj or []:
+            if isinstance(c, str):
+                out.append(c)
+            else:
+                name = getattr(c, "name", None)
+                if name:
+                    out.append(name)
+                else:
+                    out.append(str(c))
+    except Exception:
+        pass
+    return sorted(set(out))
+
+
 @app.post("/diagnose-fan-api")
 async def diagnose_fan_api() -> dict:
     """Run a single Fan-API call with full diagnostics in the response.
     No need to read container logs: you get pre-flight status, response
     headers, body snippet, and parsed result all in one JSON. Use this
-    to debug why the Fan API returns 0 items."""
+    to debug why the Fan API returns 0 items.
+
+    Each phase has its own try/except so a crash in one phase doesn't
+    erase the diagnostics from previous phases."""
     enricher = orchestrator.enricher
     cookie_jar, fan_id = enricher._parse_identity_cookie()
     out: dict = {
@@ -1476,63 +1498,84 @@ async def diagnose_fan_api() -> dict:
         return out
 
     def run() -> dict:
-        result: dict = {}
+        result: dict = {"preflight": {}, "api": {}}
         try:
-            with curl_requests.Session(impersonate="chrome") as session:
-                for k, v in cookie_jar.items():
-                    session.cookies.set(k, v, domain=".bandcamp.com")
-
-                # Pre-flight homepage
-                pf = session.get("https://bandcamp.com/", timeout=30)
-                result["preflight"] = {
-                    "status": pf.status_code,
-                    "body_bytes": len(pf.content or b""),
-                    "set_cookie_names": sorted(
-                        [c.name for c in pf.cookies] if hasattr(pf, "cookies") else []
-                    ),
-                    "html_has_pagedata": bool(
-                        pf.text and "id=\"pagedata\"" in pf.text
-                    ),
-                    "html_has_homepage_app": bool(
-                        pf.text and "id=\"HomepageApp\"" in pf.text
-                    ),
-                }
-
-                # Snapshot session cookies after pre-flight
-                result["session_cookies_after_preflight"] = sorted(
-                    [c.name for c in session.cookies]
-                )
-
-                # API call with explicit Origin/Referer headers
-                now_ts = int(datetime.now(timezone.utc).timestamp())
-                token = f"{now_ts}:0:a::"
-                ar = session.post(
-                    BANDCAMP_API_URL,
-                    json={
-                        "fan_id": fan_id,
-                        "older_than_token": token,
-                        "count": 100,
-                    },
-                    headers={
-                        "Origin": "https://bandcamp.com",
-                        "Referer": "https://bandcamp.com/",
-                    },
-                    timeout=30,
-                )
-                result["api"] = {
-                    "status": ar.status_code,
-                    "body_first_500": (ar.text or "")[:500],
-                }
-                try:
-                    data = ar.json()
-                    result["api"]["json_keys"] = list(data.keys())
-                    result["api"]["items_count"] = len(data.get("items") or [])
-                    result["api"]["more_available"] = data.get("more_available")
-                    result["api"]["last_token"] = data.get("last_token")
-                except Exception as e:
-                    result["api"]["json_error"] = str(e)
+            session = curl_requests.Session(impersonate="chrome")
         except Exception as e:
-            result["raised"] = f"{type(e).__name__}: {e}"
+            result["raised_session"] = f"{type(e).__name__}: {e}"
+            return result
+
+        try:
+            for k, v in cookie_jar.items():
+                session.cookies.set(k, v, domain=".bandcamp.com")
+        except Exception as e:
+            result["raised_cookie_set"] = f"{type(e).__name__}: {e}"
+
+        # ----- pre-flight -----
+        try:
+            pf = session.get("https://bandcamp.com/", timeout=30)
+            result["preflight"]["status"] = pf.status_code
+            result["preflight"]["body_bytes"] = len(pf.content or b"")
+            result["preflight"]["set_cookie_names"] = _safe_cookie_names(
+                getattr(pf, "cookies", None)
+            )
+            text = getattr(pf, "text", "") or ""
+            result["preflight"]["html_has_pagedata"] = 'id="pagedata"' in text
+            result["preflight"]["html_has_homepage_app"] = 'id="HomepageApp"' in text
+            # Try to extract fan_id from the homepage's pagedata blob, the
+            # way bandcampsync does — that's the canonical signal that the
+            # session is recognised as authenticated.
+            m = re.search(
+                r'"identity"\s*:\s*\{[^{}]*"id"\s*:\s*(\d+)', text
+            )
+            result["preflight"]["pagedata_fan_id"] = int(m.group(1)) if m else None
+        except Exception as e:
+            result["preflight"]["raised"] = f"{type(e).__name__}: {e}"
+
+        # ----- session cookies after pre-flight -----
+        try:
+            result["session_cookies_after_preflight"] = _safe_cookie_names(
+                session.cookies
+            )
+        except Exception as e:
+            result["session_cookies_raised"] = f"{type(e).__name__}: {e}"
+
+        # ----- API call -----
+        try:
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            token = f"{now_ts}:0:a::"
+            ar = session.post(
+                BANDCAMP_API_URL,
+                json={
+                    "fan_id": fan_id,
+                    "older_than_token": token,
+                    "count": 100,
+                },
+                headers={
+                    "Origin": "https://bandcamp.com",
+                    "Referer": "https://bandcamp.com/",
+                },
+                timeout=30,
+            )
+            result["api"]["status"] = ar.status_code
+            result["api"]["body_first_500"] = (
+                getattr(ar, "text", "") or ""
+            )[:500]
+            try:
+                data = ar.json()
+                result["api"]["json_keys"] = list(data.keys())
+                result["api"]["items_count"] = len(data.get("items") or [])
+                result["api"]["more_available"] = data.get("more_available")
+                result["api"]["last_token"] = data.get("last_token")
+            except Exception as e:
+                result["api"]["json_error"] = f"{type(e).__name__}: {e}"
+        except Exception as e:
+            result["api"]["raised"] = f"{type(e).__name__}: {e}"
+
+        try:
+            session.close()
+        except Exception:
+            pass
         return result
 
     out.update(await asyncio.to_thread(run))
