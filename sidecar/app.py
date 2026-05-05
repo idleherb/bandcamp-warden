@@ -604,7 +604,9 @@ class MetadataEnricher:
         cookies_str = cookies_path.read_text(errors="replace")
         try:
             bc = Bandcamp(cookies_str)
-            bc.load_pagedata()
+            # v0.7.0 API: verify_authentication primes the session AND
+            # populates user_id from the homepage's pagedata blob.
+            bc.verify_authentication()
             bc.load_purchases()
         except BandcampError as e:
             log.warning("Fan API (bandcampsync): %s", e)
