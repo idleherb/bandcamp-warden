@@ -1588,38 +1588,50 @@ async def diagnose_fan_api() -> dict:
         except Exception as e:
             result["session_cookies_raised"] = f"{type(e).__name__}: {e}"
 
-        # ----- API call -----
-        try:
-            now_ts = int(datetime.now(timezone.utc).timestamp())
-            token = f"{now_ts}:0:a::"
-            ar = session.post(
-                BANDCAMP_API_URL,
-                json={
-                    "fan_id": fan_id,
-                    "older_than_token": token,
-                    "count": 100,
-                },
-                cookies=cookie_jar,
-                headers={
+        # ----- API call: try multiple variants to find what works -----
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        token = f"{now_ts}:0:a::"
+        variants = [
+            ("int_fan_id", {"fan_id": fan_id, "older_than_token": token, "count": 100}),
+            ("str_fan_id", {"fan_id": str(fan_id), "older_than_token": token, "count": 100}),
+            ("with_xhr_header", {"fan_id": fan_id, "older_than_token": token, "count": 100}),
+        ]
+        for variant_name, body in variants:
+            try:
+                headers = {
                     "Origin": "https://bandcamp.com",
                     "Referer": "https://bandcamp.com/",
-                },
-                timeout=30,
-            )
-            result["api"]["status"] = ar.status_code
-            result["api"]["body_first_500"] = (
-                getattr(ar, "text", "") or ""
-            )[:500]
-            try:
-                data = ar.json()
-                result["api"]["json_keys"] = list(data.keys())
-                result["api"]["items_count"] = len(data.get("items") or [])
-                result["api"]["more_available"] = data.get("more_available")
-                result["api"]["last_token"] = data.get("last_token")
+                }
+                if variant_name == "with_xhr_header":
+                    headers["X-Requested-With"] = "XMLHttpRequest"
+                ar = session.post(
+                    BANDCAMP_API_URL,
+                    json=body,
+                    cookies=cookie_jar,
+                    headers=headers,
+                    timeout=30,
+                )
+                v_result: dict = {
+                    "status": ar.status_code,
+                    "body_first_300": (getattr(ar, "text", "") or "")[:300],
+                }
+                try:
+                    data = ar.json()
+                    v_result["items_count"] = len(data.get("items") or [])
+                    v_result["more_available"] = data.get("more_available")
+                    # Check if any of the secondary maps have content even
+                    # when items is empty — that would tell us auth is OK
+                    # but query params are off.
+                    for k in ("redownload_urls", "item_lookup", "purchase_infos", "tracklists", "collectors"):
+                        v = data.get(k)
+                        v_result[f"{k}_count"] = len(v) if isinstance(v, dict) else (
+                            len(v) if isinstance(v, list) else None
+                        )
+                except Exception as e:
+                    v_result["json_error"] = f"{type(e).__name__}: {e}"
+                result["api"][variant_name] = v_result
             except Exception as e:
-                result["api"]["json_error"] = f"{type(e).__name__}: {e}"
-        except Exception as e:
-            result["api"]["raised"] = f"{type(e).__name__}: {e}"
+                result["api"][variant_name] = {"raised": f"{type(e).__name__}: {e}"}
 
         try:
             session.close()
