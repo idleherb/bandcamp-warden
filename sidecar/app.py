@@ -496,67 +496,65 @@ class MetadataEnricher:
 
     # ----- cookie + fan-id parsing -----
 
-    def _parse_identity_cookie(self) -> tuple[str | None, int | None]:
-        """Return (raw_value_for_cookie_header, fan_id) from cookies.txt."""
-        cookies = self.config_view / "cookies.txt"
-        if not cookies.exists():
-            return None, None
-        chosen_value: str | None = None
-        chosen_expiry = -1
-        for line in cookies.read_text(errors="replace").splitlines():
+    def _read_all_bandcamp_cookies(self) -> dict[str, str]:
+        """Return every cookie scoped to bandcamp.com from cookies.txt.
+        Bandcamp's Fan API expects the full session cookie jar, not just
+        identity — sending only identity returns 0 items because the
+        request fails authentication / session validation."""
+        cookies: dict[str, str] = {}
+        p = self.config_view / "cookies.txt"
+        if not p.exists():
+            return cookies
+        for line in p.read_text(errors="replace").splitlines():
             if not line or line.startswith("#"):
                 continue
             parts = line.split("\t")
             if len(parts) < 7:
                 continue
-            domain, _flag, _path, _secure, expires, name, value = parts[:7]
-            if name != "identity" or "bandcamp.com" not in domain:
-                continue
-            try:
-                exp = int(expires)
-            except ValueError:
-                continue
-            # Pick the longest-lived identity row if there are duplicates.
-            if exp > chosen_expiry:
-                chosen_expiry = exp
-                chosen_value = value
-        if not chosen_value:
-            return None, None
-        # The identity cookie value is URL-encoded and contains a JSON blob
-        # with the fan_id near the end: ...%7B%22id%22%3A2041125390%2C...%7D
-        decoded = urllib.parse.unquote(chosen_value)
+            domain, _flag, _path, _secure, _expires, name, value = parts[:7]
+            if "bandcamp.com" in domain:
+                cookies[name] = value
+        return cookies
+
+    def _parse_identity_cookie(self) -> tuple[dict[str, str], int | None]:
+        """Return (cookie_jar, fan_id). cookie_jar is every bandcamp.com
+        cookie; fan_id is parsed from the identity cookie's embedded JSON
+        blob (`{"id":<fan_id>,"ex":...}`)."""
+        jar = self._read_all_bandcamp_cookies()
+        identity = jar.get("identity")
+        if not identity:
+            return jar, None
+        decoded = urllib.parse.unquote(identity)
         m = re.search(r'\{[^{}]*"id"\s*:\s*(\d+)', decoded)
         fan_id = int(m.group(1)) if m else None
-        return chosen_value, fan_id
+        return jar, fan_id
 
     # ----- Fan API -----
 
     async def _fetch_collection(
-        self, fan_id: int, identity_value: str
+        self, fan_id: int, cookie_jar: dict[str, str]
     ) -> dict[int, dict]:
         """Page through the user's full Fan-API collection. Return {item_id: row}.
 
         Bandcamp's Fan API gates non-Chrome TLS fingerprints; standard httpx
         gets blocked silently. curl_cffi.Session(impersonate="chrome") spoofs
-        a real Chrome handshake — same library bandcampsync uses, so
-        equivalent behaviour. We run the synchronous session in a thread
-        because curl_cffi has an asyncio mode but it's less battle-tested
-        and we only call this once per daily run.
+        a real Chrome handshake — same library bandcampsync uses internally.
+        The full bandcamp cookie jar is required, not just identity.
         """
         return await asyncio.to_thread(
-            self._fetch_collection_sync, fan_id, identity_value
+            self._fetch_collection_sync, fan_id, cookie_jar
         )
 
     @staticmethod
-    def _fetch_collection_sync(fan_id: int, identity_value: str) -> dict[int, dict]:
+    def _fetch_collection_sync(
+        fan_id: int, cookie_jar: dict[str, str]
+    ) -> dict[int, dict]:
         out: dict[int, dict] = {}
-        # Match bandcampsync's token format exactly: "<unix_ts>:<page_ts>:a::"
-        # — bandcamp expects exactly four colons and treats the first as a
-        # current-time anchor.
+        # bandcampsync's token format: "<unix_ts>:<page_ts>:a::"
         now_ts = int(datetime.now(timezone.utc).timestamp())
         token = f"{now_ts}:0:a::"
         with curl_requests.Session(impersonate="chrome") as session:
-            for _ in range(100):  # hard cap on pagination loop
+            for page in range(100):  # hard cap on pagination
                 try:
                     r = session.post(
                         BANDCAMP_API_URL,
@@ -565,21 +563,30 @@ class MetadataEnricher:
                             "older_than_token": token,
                             "count": 100,
                         },
-                        cookies={"identity": identity_value},
+                        cookies=cookie_jar,
                         timeout=30,
                     )
-                    if r.status_code != 200:
-                        log.warning(
-                            "Fan API returned HTTP %s; aborting pagination at %d items",
-                            r.status_code, len(out),
-                        )
-                        break
+                except Exception as e:
+                    log.warning("Fan API request raised: %s", e)
+                    break
+                if r.status_code != 200:
+                    body = (r.text or "")[:200]
+                    log.warning(
+                        "Fan API page %d → HTTP %s, body: %r",
+                        page, r.status_code, body,
+                    )
+                    break
+                try:
                     data = r.json()
                 except Exception as e:
-                    log.warning("Fan API fetch failed: %s", e)
+                    log.warning("Fan API page %d JSON decode failed: %s", page, e)
                     break
                 items = data.get("items") or []
                 if not items:
+                    log.info(
+                        "Fan API page %d: 0 items (more_available=%s, keys=%s)",
+                        page, data.get("more_available"), list(data.keys())[:6],
+                    )
                     break
                 for it in items:
                     iid = it.get("tralbum_id") or it.get("item_id")
@@ -592,7 +599,7 @@ class MetadataEnricher:
                 if not next_token or next_token == token:
                     break
                 token = next_token
-        log.info("Fan API: collected %d items", len(out))
+        log.info("Fan API: collected %d items total", len(out))
         return out
 
     # ----- writing -----
@@ -636,10 +643,10 @@ class MetadataEnricher:
         if not seen:
             return {"observed": 0, "written": 0, "orphaned": 0, "api": False}
 
-        identity_value, fan_id = self._parse_identity_cookie()
+        cookie_jar, fan_id = self._parse_identity_cookie()
         api_map: dict[int, dict] = {}
-        if identity_value and fan_id:
-            api_map = await self._fetch_collection(fan_id, identity_value)
+        if cookie_jar and fan_id:
+            api_map = await self._fetch_collection(fan_id, cookie_jar)
         else:
             log.warning(
                 "Could not extract identity cookie or fan_id; "
@@ -701,12 +708,17 @@ class MetadataEnricher:
 
         only_missing: if True, skip folders that already have a bandcamp_*.json.
         """
-        identity_value, fan_id = self._parse_identity_cookie()
-        if not identity_value or not fan_id:
+        cookie_jar, fan_id = self._parse_identity_cookie()
+        if not cookie_jar or not fan_id:
             return {"error": "could not parse identity cookie / fan_id", "written": 0}
-        api_map = await self._fetch_collection(fan_id, identity_value)
+        api_map = await self._fetch_collection(fan_id, cookie_jar)
         if not api_map:
-            return {"error": "Fan API returned no items", "written": 0}
+            return {
+                "error": "Fan API returned no items — see sidecar logs for HTTP status",
+                "written": 0,
+                "fan_id": fan_id,
+                "cookie_count": len(cookie_jar),
+            }
 
         # Index existing album folders by their basename (Album title) and
         # parent name (Artist). This is best-effort matching and may miss
