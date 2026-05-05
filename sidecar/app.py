@@ -120,6 +120,30 @@ class _NoHealthzFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_NoHealthzFilter())
 
 
+class _RingLogHandler(logging.Handler):
+    """In-memory ring buffer for the sidecar's own logs, so the
+    /sidecar-logs endpoint can return them without docker access."""
+
+    def __init__(self, capacity: int = 2000) -> None:
+        super().__init__()
+        self.buffer: deque[str] = deque(maxlen=capacity)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.buffer.append(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+_sidecar_log_buffer = _RingLogHandler(capacity=2000)
+_sidecar_log_buffer.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+)
+_sidecar_log_buffer.setLevel(logging.INFO)
+# Attach to the root logger so we capture warden, uvicorn, apscheduler etc.
+logging.getLogger().addHandler(_sidecar_log_buffer)
+
+
 # ---------- Patterns ----------
 
 # Anomaly = the precursor pattern that previously cost the user's account.
@@ -1360,8 +1384,17 @@ async def status_endpoint() -> dict:
 
 @app.get("/logs")
 async def logs(lines: int = 200) -> dict:
+    """bandcampsync's container logs (per-album download progress)."""
     n = max(1, min(lines, settings.log_buffer_size))
     return {"lines": list(orchestrator.log_buffer)[-n:]}
+
+
+@app.get("/sidecar-logs")
+async def sidecar_logs(lines: int = 200) -> dict:
+    """Sidecar's own logs (warden, uvicorn, apscheduler) from a ring
+    buffer. Lets us debug without container shell access."""
+    n = max(1, min(lines, 2000))
+    return {"lines": list(_sidecar_log_buffer.buffer)[-n:]}
 
 
 @app.post("/trigger")
@@ -1423,3 +1456,84 @@ async def backfill_metadata(force: bool = False) -> dict:
     Run this manually after the Fan API was unreachable during a daily
     run, or after deploying a sidecar version with new fields."""
     return await orchestrator.enricher.backfill(only_missing=not force)
+
+
+@app.post("/diagnose-fan-api")
+async def diagnose_fan_api() -> dict:
+    """Run a single Fan-API call with full diagnostics in the response.
+    No need to read container logs: you get pre-flight status, response
+    headers, body snippet, and parsed result all in one JSON. Use this
+    to debug why the Fan API returns 0 items."""
+    enricher = orchestrator.enricher
+    cookie_jar, fan_id = enricher._parse_identity_cookie()
+    out: dict = {
+        "fan_id": fan_id,
+        "cookie_count": len(cookie_jar),
+        "cookie_names": sorted(cookie_jar.keys()),
+    }
+    if not fan_id or not cookie_jar:
+        out["error"] = "no fan_id or no cookies"
+        return out
+
+    def run() -> dict:
+        result: dict = {}
+        try:
+            with curl_requests.Session(impersonate="chrome") as session:
+                for k, v in cookie_jar.items():
+                    session.cookies.set(k, v, domain=".bandcamp.com")
+
+                # Pre-flight homepage
+                pf = session.get("https://bandcamp.com/", timeout=30)
+                result["preflight"] = {
+                    "status": pf.status_code,
+                    "body_bytes": len(pf.content or b""),
+                    "set_cookie_names": sorted(
+                        [c.name for c in pf.cookies] if hasattr(pf, "cookies") else []
+                    ),
+                    "html_has_pagedata": bool(
+                        pf.text and "id=\"pagedata\"" in pf.text
+                    ),
+                    "html_has_homepage_app": bool(
+                        pf.text and "id=\"HomepageApp\"" in pf.text
+                    ),
+                }
+
+                # Snapshot session cookies after pre-flight
+                result["session_cookies_after_preflight"] = sorted(
+                    [c.name for c in session.cookies]
+                )
+
+                # API call with explicit Origin/Referer headers
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                token = f"{now_ts}:0:a::"
+                ar = session.post(
+                    BANDCAMP_API_URL,
+                    json={
+                        "fan_id": fan_id,
+                        "older_than_token": token,
+                        "count": 100,
+                    },
+                    headers={
+                        "Origin": "https://bandcamp.com",
+                        "Referer": "https://bandcamp.com/",
+                    },
+                    timeout=30,
+                )
+                result["api"] = {
+                    "status": ar.status_code,
+                    "body_first_500": (ar.text or "")[:500],
+                }
+                try:
+                    data = ar.json()
+                    result["api"]["json_keys"] = list(data.keys())
+                    result["api"]["items_count"] = len(data.get("items") or [])
+                    result["api"]["more_available"] = data.get("more_available")
+                    result["api"]["last_token"] = data.get("last_token")
+                except Exception as e:
+                    result["api"]["json_error"] = str(e)
+        except Exception as e:
+            result["raised"] = f"{type(e).__name__}: {e}"
+        return result
+
+    out.update(await asyncio.to_thread(run))
+    return out
