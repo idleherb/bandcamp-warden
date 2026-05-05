@@ -1535,13 +1535,48 @@ async def diagnose_fan_api() -> dict:
             text = getattr(pf, "text", "") or ""
             result["preflight"]["html_has_pagedata"] = 'id="pagedata"' in text
             result["preflight"]["html_has_homepage_app"] = 'id="HomepageApp"' in text
-            # Try to extract fan_id from the homepage's pagedata blob, the
-            # way bandcampsync does — that's the canonical signal that the
-            # session is recognised as authenticated.
+            result["preflight"]["html_has_fan_id"] = (str(fan_id) in text)
+            # Try to extract fan_id from the homepage's pagedata blob.
             m = re.search(
                 r'"identity"\s*:\s*\{[^{}]*"id"\s*:\s*(\d+)', text
             )
             result["preflight"]["pagedata_fan_id"] = int(m.group(1)) if m else None
+            # If our fan_id appears anywhere in the HTML, snapshot the
+            # surrounding 300 chars so we can see what shape the identity
+            # blob has (the regex may need updating).
+            idx = text.find(str(fan_id))
+            if idx > 0:
+                start = max(0, idx - 100)
+                result["preflight"]["fan_id_html_context"] = text[start:idx + 200]
+            # Also: snapshot the first 500 chars where "pagedata" appears
+            # so we can see Bandcamp's current data shape.
+            pd_idx = text.find("id=\"pagedata\"")
+            if pd_idx > 0:
+                result["preflight"]["pagedata_snippet"] = text[pd_idx:pd_idx + 500]
+            # Headers tell us if curl_cffi sent our identity cookie.
+            try:
+                req = pf.request
+                hdrs = dict(getattr(req, "headers", None) or {})
+                cookie_hdr = hdrs.get("Cookie") or hdrs.get("cookie")
+                if cookie_hdr:
+                    # Mask the actual identity value, keep the prefix to confirm shape.
+                    masked = re.sub(
+                        r"identity=([^;]*)",
+                        lambda m: f"identity={m.group(1)[:25]}…(len={len(m.group(1))})",
+                        cookie_hdr,
+                    )
+                    result["preflight"]["request_cookie_header"] = masked
+            except Exception:
+                pass
+            # And the response Set-Cookie headers — if Bandcamp replaces
+            # our identity with a fresh one, that tells us auth was rejected.
+            try:
+                set_cookie_headers = pf.headers.get_list("Set-Cookie") if hasattr(pf.headers, "get_list") else []
+            except Exception:
+                set_cookie_headers = []
+            result["preflight"]["response_sets_identity"] = any(
+                "identity=" in (h or "") for h in set_cookie_headers
+            )
         except Exception as e:
             result["preflight"]["raised"] = f"{type(e).__name__}: {e}"
 
