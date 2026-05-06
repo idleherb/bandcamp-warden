@@ -133,6 +133,18 @@ curl -X POST 'http://homeserver:31080/backfill-metadata'
 curl -X POST 'http://homeserver:31080/backfill-metadata?force=true'
 ```
 
+## Bandcampsync download patch
+
+bandcampsync 0.7.0's downloader uses curl_cffi with `impersonate="chrome"`, which sets `LOW_SPEED_TIME=30` / `LOW_SPEED_LIMIT=1` — abort the stream after 30 seconds of less than 1 byte/sec. Bandcamp's edge sometimes pauses bursts mid-album, especially on big FLAC archives, and that triggers a curl-error-28 crash.
+
+Browsers don't have this stall detection at all (the user could download the same album manually with no problem), so the fix is to be more patient on our side without making Bandcamp work harder.
+
+The sidecar ships a patched `download.py` under `/app/patches/bandcampsync_download.py` and stages it under `<HOST_STATE_PATH>/patches/` on every boot. The bandcampsync container then bind-mounts it over the upstream module file at `/usr/local/lib/python3.13/dist-packages/bandcampsync/download.py:ro`. The patch only changes one thing: the curl session uses `LOW_SPEED_TIME=300` / `LOW_SPEED_LIMIT=1024`, so a stall has to last 5 minutes of <1KB/s before we give up.
+
+Disable it (e.g. for an A/B test) by setting `WARDEN_BANDCAMPSYNC_PATCH_ENABLED=false` in the compose env. Verify it's active by looking for `[warden patch] download_file using patient curl options` in `/logs` after a daily run.
+
+If you upgrade `WARDEN_BANDCAMPSYNC_IMAGE` to a future bandcampsync version where the module path differs (e.g. Python 3.14), update `WARDEN_BANDCAMPSYNC_PATCH_TARGET` too.
+
 ## Auto-retry on bandcampsync crashes
 
 If bandcampsync exits with a non-zero code (network blip, ISP outage, server stall, etc.) the sidecar treats it as a **transient failure**, not a completion. It does not set `collection_complete`. It schedules an automatic retry per `WARDEN_RETRY_BACKOFFS_MINUTES` (default `[5, 15, 60]`), capped at `WARDEN_RETRY_MAX_PER_DAY` retries (default 3 → 1 initial + 3 retries = 4 attempts max). The baseline downloaded-count for the day is preserved across retries, so the daily quota is enforced over the whole day rather than reset on each attempt. Telegram says `🔁 Tag N Retry M/X` for each retry attempt.

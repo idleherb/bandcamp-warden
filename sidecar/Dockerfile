@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY patches /app/patches
 
 # Build provenance — populated by the GHA workflow, surfaced via /healthz.
 ARG GIT_COMMIT=unknown

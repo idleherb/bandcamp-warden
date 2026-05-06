@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # Host paths (passed into bandcampsync container as bind mounts)
     host_downloads_path: str  # e.g. /mnt/storage/media/bandcamp
     host_config_path: str     # e.g. /mnt/apps/bandcamp-warden/config
+    # Optional: host path of the sidecar's /state mount. If set, the
+    # patched bandcampsync download.py is staged under <state>/patches/
+    # and bind-mounted into the bandcampsync container at runtime.
+    host_state_path: str = ""
 
     # In-sidecar paths (where the sidecar itself sees the data)
     state_path: str = "/state"
@@ -72,6 +76,15 @@ class Settings(BaseSettings):
     anomaly_window: int = 15        # how many recent log lines we keep
     anomaly_threshold: int = 3      # matches in the window → emergency stop
     log_buffer_size: int = 2000     # in-memory ring buffer exposed via /logs
+
+    # bandcampsync patch: replaces the upstream download.py with a
+    # version that tolerates 5 min of <1KB/s before aborting (vs the
+    # default ~30s of <1B/s that was causing curl-error-28 crashes
+    # mid-album on big Vaporwave releases).
+    bandcampsync_patch_enabled: bool = True
+    bandcampsync_patch_target: str = (
+        "/usr/local/lib/python3.13/dist-packages/bandcampsync/download.py"
+    )
 
     # Cookie expiry monitoring
     cookies_path: str = "/config/cookies.txt"
@@ -415,14 +428,35 @@ class BandcampsyncController:
             "RETRY_WAIT": str(s.bandcampsync_retry_wait),
             # Deliberately NOT setting RUN_DAILY_AT — keeps it one-shot.
         }
+        volumes = {
+            s.host_config_path: {"bind": "/config", "mode": "rw"},
+            s.host_downloads_path: {"bind": "/downloads", "mode": "rw"},
+        }
+        # Mount the patched download.py over the upstream module file
+        # so bandcampsync inherits our patient curl options.
+        if s.bandcampsync_patch_enabled and s.host_state_path:
+            patch_host = (
+                f"{s.host_state_path.rstrip('/')}/patches/bandcampsync_download.py"
+            )
+            volumes[patch_host] = {
+                "bind": s.bandcampsync_patch_target,
+                "mode": "ro",
+            }
+            log.info(
+                "Bandcampsync download.py patch active: %s → %s",
+                patch_host, s.bandcampsync_patch_target,
+            )
+        elif s.bandcampsync_patch_enabled:
+            log.warning(
+                "bandcampsync_patch_enabled=true but host_state_path is "
+                "empty — patch will NOT be applied"
+            )
+
         kwargs: dict = dict(
             image=s.bandcampsync_image,
             name=s.bandcampsync_container,
             environment=env,
-            volumes={
-                s.host_config_path: {"bind": "/config", "mode": "rw"},
-                s.host_downloads_path: {"bind": "/downloads", "mode": "rw"},
-            },
+            volumes=volumes,
             detach=True,
             remove=False,  # we read logs after exit, so don't auto-remove
             restart_policy={"Name": "no"},
@@ -1338,8 +1372,33 @@ orchestrator = Orchestrator(
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
 
+def _stage_bandcampsync_patch() -> None:
+    """Copy the in-image patched download.py to /state/patches/ so the
+    bandcampsync container can bind-mount it. Idempotent — runs every
+    sidecar boot, picks up patch updates automatically when sidecar is
+    rebuilt."""
+    src = Path("/app/patches/bandcampsync_download.py")
+    if not src.exists():
+        log.warning(
+            "bandcampsync patch source missing at %s; patch disabled", src
+        )
+        return
+    dst_dir = Path(settings.state_path) / "patches"
+    dst = dst_dir / "bandcampsync_download.py"
+    try:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        # shutil.copyfile does what we want — overwrite, preserve content.
+        import shutil as _sh
+        _sh.copyfile(src, dst)
+        log.info("Staged bandcampsync patch at %s", dst)
+    except Exception as e:
+        log.error("Failed to stage bandcampsync patch: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if settings.bandcampsync_patch_enabled:
+        _stage_bandcampsync_patch()
     scheduler.add_job(
         orchestrator.daily_kickoff,
         CronTrigger(hour=settings.daily_run_hour, minute=0),

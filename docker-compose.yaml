@@ -20,6 +20,11 @@ services:
       WARDEN_TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
       WARDEN_HOST_DOWNLOADS_PATH: "${HOST_DOWNLOADS_PATH:-/mnt/storage/media/bandcamp}"
       WARDEN_HOST_CONFIG_PATH: "${HOST_CONFIG_PATH:-/mnt/apps/bandcamp-warden/config}"
+      # Host path of the sidecar's /state mount. Required for the
+      # bandcampsync download.py patch (LOW_SPEED_TIME bump) — the
+      # sidecar stages the patch under <state>/patches/ and bind-mounts
+      # it into bandcampsync at runtime.
+      WARDEN_HOST_STATE_PATH: "${HOST_STATE_PATH:-/mnt/apps/bandcamp-warden/state}"
 
       # --- schedule + ramp ---
       WARDEN_DAILY_RUN_HOUR: "${DAILY_RUN_HOUR:-3}"
