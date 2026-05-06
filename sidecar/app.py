@@ -1617,12 +1617,35 @@ def _probe_download(
     last_chunk_at = start
     max_gap = 0.0
 
+    def make_session():
+        # curl_cffi's API surface for setting raw libcurl options has
+        # moved between versions: some accept curl_options on Session(),
+        # some on per-request, some only via subclass. Try the easiest
+        # paths first; fall back to subclassing _set_curl_options.
+        try:
+            return curl_requests.Session(
+                impersonate="chrome",
+                curl_options=curl_options or None,
+            )
+        except TypeError:
+            pass
+
+        class _Patient(curl_requests.Session):  # type: ignore
+            def _set_curl_options(self, curl, *a, **kw):  # type: ignore
+                parent = getattr(super(), "_set_curl_options", None)
+                if parent:
+                    parent(curl, *a, **kw)
+                for k, v in (curl_options or {}).items():
+                    try:
+                        curl.setopt(k, v)
+                    except Exception as exc:
+                        log.warning("setopt(%s) failed: %s", k, exc)
+
+        return _Patient(impersonate="chrome")
+
     try:
-        with curl_requests.Session(impersonate="chrome") as session:
-            kwargs: dict = {"stream": True, "timeout": max_seconds + 60}
-            if curl_options:
-                kwargs["curl_options"] = curl_options
-            r = session.get(url, **kwargs)
+        with make_session() as session:
+            r = session.get(url, stream=True, timeout=max_seconds + 60)
             http_status = r.status_code
             if r.status_code != 200:
                 return {
