@@ -1489,6 +1489,193 @@ async def sample_metadata(count: int = 5) -> dict:
     }
 
 
+@app.post("/test-download")
+async def test_download(
+    max_seconds: int = 1800,
+    max_bytes: int = 0,
+    item_id: int | None = None,
+) -> dict:
+    """Probe a Bandcamp download URL with multiple curl_cffi timeout
+    configs. Tests the hypothesis that curl-error-28 (server-stall
+    detection) is what's killing daily runs — and that a more patient
+    config fixes it without making Bandcamp throttle us harder.
+
+    Three variants run sequentially against the same album:
+      * default_chrome_impersonate — what bandcampsync ships with
+      * patient_5min_1kb — abort only if <1KB/s sustained for 5 min
+      * no_stall_check — never abort on slow transfer
+
+    max_seconds: wall-clock cap per variant (default 1800 = 30 min)
+    max_bytes:   stop each variant after N bytes (0 = full file)
+    item_id:     specific item to test, otherwise picks first purchase
+    """
+    if controller.is_running():
+        return {
+            "error": "bandcampsync is currently running; the test would "
+                     "compete with it for bandwidth and produce confusing "
+                     "results. Wait until status.bandcampsync_running is false."
+        }
+    return await asyncio.to_thread(
+        _test_download_sync, item_id, max_seconds, max_bytes,
+    )
+
+
+def _test_download_sync(
+    item_id: int | None, max_seconds: int, max_bytes: int,
+) -> dict:
+    from bandcampsync.bandcamp import Bandcamp  # type: ignore
+
+    cookies_path = Path(settings.config_view_path) / "cookies.txt"
+    if not cookies_path.exists():
+        return {"error": "cookies.txt missing"}
+
+    try:
+        bc = Bandcamp(cookies_path.read_text(errors="replace"))
+        bc.verify_authentication()
+        bc.load_purchases()
+    except Exception as e:
+        return {"error": f"bandcampsync init: {type(e).__name__}: {e}"}
+
+    target = None
+    if item_id is not None:
+        for p in bc.purchases:
+            if p.item_id == item_id:
+                target = p
+                break
+        if target is None:
+            return {"error": f"item_id {item_id} not in purchases"}
+    elif bc.purchases:
+        target = bc.purchases[0]
+    if target is None:
+        return {"error": "no purchases available"}
+
+    variants = [
+        ("default_chrome_impersonate", {}),
+        ("patient_5min_1kb", {"LOW_SPEED_TIME": 300, "LOW_SPEED_LIMIT": 1024}),
+        ("no_stall_check", {"LOW_SPEED_TIME": 0, "LOW_SPEED_LIMIT": 0}),
+    ]
+
+    results: list[dict] = []
+    for variant_name, options in variants:
+        try:
+            url = bc.get_download_file_url(target, encoding="flac")
+        except Exception as e:
+            results.append({
+                "variant": variant_name,
+                "error": f"URL resolution: {type(e).__name__}: {e}",
+            })
+            continue
+        if not url:
+            results.append({
+                "variant": variant_name,
+                "error": "URL resolution returned empty",
+            })
+            continue
+        result = _probe_download(url, options, max_seconds, max_bytes)
+        result["variant"] = variant_name
+        results.append(result)
+
+    return {
+        "item_id": target.item_id,
+        "band_name": target.band_name,
+        "item_title": target.item_title,
+        "test_max_seconds": max_seconds,
+        "test_max_bytes": max_bytes,
+        "results": results,
+    }
+
+
+def _probe_download(
+    url: str, named_options: dict, max_seconds: int, max_bytes: int,
+) -> dict:
+    """Stream bytes from `url`, discard them, report what happened."""
+    import time as _time
+
+    try:
+        from curl_cffi import CurlOpt as _CurlOpt  # type: ignore
+    except ImportError:
+        try:
+            from curl_cffi.const import CurlOpt as _CurlOpt  # type: ignore
+        except ImportError:
+            _CurlOpt = None  # type: ignore
+
+    curl_options: dict = {}
+    if _CurlOpt is not None:
+        for name, val in named_options.items():
+            opt = getattr(_CurlOpt, name, None)
+            if opt is not None:
+                curl_options[opt] = val
+    options_resolved = bool(curl_options) == bool(named_options)
+
+    start = _time.time()
+    bytes_dl = 0
+    content_length = 0
+    completed = False
+    early_stop: str | None = None
+    error: str | None = None
+    http_status: int | None = None
+    last_chunk_at = start
+    max_gap = 0.0
+
+    try:
+        with curl_requests.Session(impersonate="chrome") as session:
+            kwargs: dict = {"stream": True, "timeout": max_seconds + 60}
+            if curl_options:
+                kwargs["curl_options"] = curl_options
+            r = session.get(url, **kwargs)
+            http_status = r.status_code
+            if r.status_code != 200:
+                return {
+                    "status": "fail",
+                    "http_status": r.status_code,
+                    "duration_seconds": round(_time.time() - start, 1),
+                    "error": f"HTTP {r.status_code}",
+                    "options_resolved": options_resolved,
+                }
+            try:
+                content_length = int(r.headers.get("content-length", "0") or "0")
+            except Exception:
+                content_length = 0
+
+            for chunk in r.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    now = _time.time()
+                    gap = now - last_chunk_at
+                    if gap > max_gap:
+                        max_gap = gap
+                    last_chunk_at = now
+                    bytes_dl += len(chunk)
+                    if max_bytes and bytes_dl >= max_bytes:
+                        early_stop = "max_bytes"
+                        break
+                    if now - start > max_seconds:
+                        early_stop = "max_seconds"
+                        break
+            else:
+                completed = True
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+
+    duration = max(0.001, _time.time() - start)
+    return {
+        "status": "ok" if not error and (completed or early_stop) else "fail",
+        "completed": completed,
+        "early_stop": early_stop,
+        "http_status": http_status,
+        "content_length": content_length,
+        "bytes_downloaded": bytes_dl,
+        "percent_complete": (
+            round(bytes_dl / content_length * 100, 1) if content_length else None
+        ),
+        "duration_seconds": round(duration, 1),
+        "avg_mbps": round((bytes_dl * 8 / 1_000_000) / duration, 2),
+        "max_gap_between_chunks_s": round(max_gap, 1),
+        "options_applied": list(named_options.keys()) if options_resolved else [],
+        "options_resolved": options_resolved,
+        "error": error,
+    }
+
+
 @app.post("/backfill-metadata")
 async def backfill_metadata(force: bool = False) -> dict:
     """Walk the existing /downloads tree and write bandcamp_<id>.json for
