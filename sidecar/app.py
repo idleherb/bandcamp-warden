@@ -987,15 +987,15 @@ class Orchestrator:
             "(Resume bleibt erhalten — die Marker liegen in den Album-Ordnern.)"
         )
 
-    async def daily_kickoff(self) -> None:
+    async def daily_kickoff(self, override_quota: int | None = None) -> None:
         """Top-level entry point. APScheduler fires this once per day."""
         if self._run_lock.locked():
             log.warning("Kickoff skipped — previous run still in progress")
             return
         async with self._run_lock:
-            await self._do_kickoff()
+            await self._do_kickoff(override_quota=override_quota)
 
-    async def _do_kickoff(self) -> None:
+    async def _do_kickoff(self, override_quota: int | None = None) -> None:
         s = self.state.get()
         run_date = date.today().isoformat()
 
@@ -1019,7 +1019,11 @@ class Orchestrator:
             s = self.state.get()
 
         day_index = self.days_in(s["started_on"])
-        quota = self.quota_for_day(day_index)
+        quota = (
+            override_quota
+            if override_quota is not None and override_quota > 0
+            else self.quota_for_day(day_index)
+        )
 
         # Baseline must be set ONCE per day and reused across retries —
         # otherwise a retry resets the count and we'd download up to
@@ -1505,12 +1509,16 @@ async def sidecar_logs(lines: int = 200) -> dict:
 
 
 @app.post("/trigger")
-async def trigger_now() -> dict:
-    """Manually fire the daily kickoff. Useful for first-deploy smoke test."""
+async def trigger_now(quota: int | None = None) -> dict:
+    """Manually fire the daily kickoff. Useful for first-deploy smoke test.
+
+    Optional `quota` parameter overrides today's ramp-up quota for this
+    one run. Use small values (e.g. quota=1) to validate the entire
+    pipeline end-to-end without burning a 200-album daily budget."""
     if orchestrator._run_lock.locked():
         raise HTTPException(409, "A run is already in progress")
-    asyncio.create_task(orchestrator.daily_kickoff())
-    return {"triggered": True}
+    asyncio.create_task(orchestrator.daily_kickoff(override_quota=quota))
+    return {"triggered": True, "quota_override": quota}
 
 
 @app.post("/stop")
