@@ -271,6 +271,8 @@ class WardenDownloader:
         band = item.band_name or "?"
         title = item.item_title or "?"
 
+        import time as _time
+        dl_started = _time.time()
         with TemporaryDirectory(prefix="warden_dl_") as td:
             tmp_zip = Path(td) / f"item_{iid}.bin"
             try:
@@ -284,6 +286,12 @@ class WardenDownloader:
                     success=False, item_id=iid, band_name=band, item_title=title,
                     folder=None, bytes_written=0, resumes=0, error=err,
                 )
+            dl_seconds = max(0.001, _time.time() - dl_started)
+            mbps = (bytes_written / 1_000_000) / dl_seconds
+            log_event(
+                f"  ↓ {bytes_written / 1_000_000:.1f} MB in "
+                f"{dl_seconds:.1f}s = {mbps:.2f} MB/s"
+            )
 
             artist_dir = self.downloads_root / clean_path_component(band)
             album_dir = artist_dir / clean_path_component(title)
