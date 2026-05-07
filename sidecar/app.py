@@ -91,6 +91,13 @@ class Settings(BaseSettings):
     cookie_warn_threshold_days: int = 14
     cookie_check_hour: int = 12     # daily check at midday — shows up at a sane time
 
+    # Downloader strategy: "container" = spawn bandcampsync docker
+    # container per run (legacy, has unfixable throttling problems);
+    # "sidecar" = run downloads in-process via WardenDownloader
+    # (uses curl_cffi+chrome+browser_headers, validated to bypass
+    # Bandcamp's CDN throttling).
+    downloader_strategy: str = "sidecar"
+
     # Resilience: auto-retry after bandcampsync crash (network blip, etc.)
     retry_max_per_day: int = 3
     retry_backoffs_minutes: list[int] = Field(default_factory=lambda: [5, 15, 60])
@@ -1055,6 +1062,11 @@ class Orchestrator:
         # Reset user-stop signal at the start of every new attempt.
         self._user_stop_requested = False
 
+        if self.settings.downloader_strategy == "sidecar":
+            await self._kickoff_sidecar(run_date, baseline, quota, attempt)
+            return
+
+        # Legacy: spawn bandcampsync container.
         try:
             container = self.controller.start()
         except Exception as e:
@@ -1070,6 +1082,150 @@ class Orchestrator:
 
         self.enricher.begin_run()
         await self._monitor(run_date, baseline, quota, container, attempt)
+
+    async def _kickoff_sidecar(
+        self, run_date: str, baseline: int, quota: int, attempt: int,
+    ) -> None:
+        """Plan C kickoff: download albums in-process via WardenDownloader.
+
+        No bandcampsync container spawn, no log-stream parsing — direct
+        Python control of the download flow with curl_cffi+chrome+
+        browser_headers (the combination that empirically gets Bandcamp
+        to serve files at MB/s rather than throttling to 0).
+        """
+        from downloader import WardenDownloader  # local module
+
+        # /config must be writable so WardenDownloader can append to
+        # ignores.txt. Otherwise we'd download the same albums every
+        # day. Detect early, fail loudly.
+        config_dir = Path(self.settings.config_view_path)
+        probe = config_dir / ".warden_write_probe"
+        try:
+            probe.write_text("ok")
+            probe.unlink()
+        except Exception as e:
+            err = (
+                f"/config not writable: {type(e).__name__}: {e}. "
+                f"Update compose: change `{config_dir}:ro` to `{config_dir}` "
+                f"(remove `:ro`)."
+            )
+            log.error(err)
+            self.state.update_run(
+                run_date, status="failed_to_start", stop_reason=err,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+            await self.telegram.send(
+                "❌ *Start fehlgeschlagen*\n"
+                "Sidecar-Strategy braucht /config als rw-Mount. "
+                "TrueNAS-YAML: das `:ro` am /config-Volume entfernen, "
+                "Save → Container Restart."
+            )
+            return
+
+        downloads_root = Path(self.settings.downloads_view_path)
+        config_dir = Path(self.settings.config_view_path)
+        dl = WardenDownloader(
+            downloads_root=downloads_root,
+            config_dir=config_dir,
+            format_name="flac",
+        )
+
+        # Wire the downloader's cancel signal to our user-stop flag.
+        # /stop sets self._user_stop_requested; we'd ideally observe it
+        # in a callback. WardenDownloader checks dl.cancel_requested
+        # between albums, so we just propagate.
+        async def _watch_user_stop():
+            while not dl.cancel_requested:
+                if self._user_stop_requested:
+                    dl.cancel_requested = True
+                    return
+                await asyncio.sleep(2)
+        watcher = asyncio.create_task(_watch_user_stop())
+
+        # log_event callback: emit warden-namespaced log lines so the
+        # ring buffer captures them, plus push selected lines to the
+        # log_buffer so /logs continues to surface activity.
+        def _log(s: str) -> None:
+            log.info("daily-run: %s", s)
+            self.log_buffer.append(s)
+
+        try:
+            summary = await dl.run_daily(
+                quota=quota, baseline_count=baseline, log_event=_log,
+            )
+        finally:
+            watcher.cancel()
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Persist + telegram.
+        finished_at = summary.finished_at
+        downloaded_today = summary.downloaded
+        final = summary.final_count
+
+        if summary.stop_reason == "quota_hit":
+            self.state.update_run(
+                run_date, downloaded=downloaded_today, status="quota_hit",
+                stop_reason="daily quota reached", finished_at=finished_at,
+            )
+            msg = (
+                f"✅ *Tag fertig* (`{run_date}`)\n"
+                f"Heute: *{downloaded_today}*/{quota}\nGesamt: *{final}*"
+            )
+        elif summary.stop_reason == "cancelled":
+            self.state.update_run(
+                run_date, downloaded=downloaded_today, status="completed",
+                stop_reason="user-initiated stop", finished_at=finished_at,
+            )
+            msg = (
+                f"⏹ *Manuell gestoppt* (`{run_date}`)\n"
+                f"Heute: *{downloaded_today}*/{quota}, Gesamt: *{final}*"
+            )
+        elif summary.stop_reason == "failed_to_start":
+            self.state.update_run(
+                run_date, downloaded=downloaded_today, status="failed_to_start",
+                stop_reason=summary.last_error, finished_at=finished_at,
+            )
+            msg = (
+                f"❌ *Start fehlgeschlagen*\n```\n{summary.last_error}\n```"
+            )
+        else:
+            # Reached end of purchase list without hitting quota.
+            self.state.update_run(
+                run_date, downloaded=downloaded_today, status="completed",
+                stop_reason="no more items", finished_at=finished_at,
+            )
+            if downloaded_today == 0 and summary.skipped > 0:
+                # All purchases already in ignores.txt → done.
+                self.state.update(collection_complete=1)
+                msg = (
+                    f"🎉 *Collection vollständig*\n"
+                    f"Alle {summary.skipped} Items schon lokal.\n"
+                    f"Gesamt: *{final}*"
+                )
+            elif downloaded_today > 0:
+                self.state.update(collection_complete=1)
+                msg = (
+                    f"🎉 *Collection vollständig*\n"
+                    f"Heute zuletzt: *{downloaded_today}* Alben.\n"
+                    f"Gesamt: *{final}*"
+                )
+            else:
+                msg = (
+                    f"⚠️ *Tag mit 0 Alben beendet* (`{run_date}`)\n"
+                    f"Failures: *{len(summary.failures)}*\n"
+                    f"Letzter Fehler: `{summary.last_error}`"
+                )
+
+        # Append failure summary if any.
+        if summary.failures:
+            msg += f"\n\n❗ *{len(summary.failures)}* Fehler"
+            if summary.last_error:
+                msg += f": `{summary.last_error[:200]}`"
+
+        await self.telegram.send(msg)
 
     async def _monitor(self, run_date: str, baseline: int, quota: int, container, attempt: int) -> None:
         recent: deque[str] = deque(maxlen=self.settings.anomaly_window)
