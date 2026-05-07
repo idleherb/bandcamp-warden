@@ -1666,6 +1666,156 @@ def _test_range_sync(item_id: int | None) -> dict:
     return out
 
 
+@app.post("/test-browser-headers")
+async def test_browser_headers(
+    item_id: int | None = None, sample_bytes: int = 5_000_000,
+) -> dict:
+    """Diagnose: download a slice of an album using FULL browser-faithful
+    headers (Referer, Sec-Fetch-*, Accept, Accept-Language, etc.) — the
+    set a real Chrome navigation would emit. Compare throughput with the
+    plain-headers variant to determine whether Bandcamp's CDN
+    throttles non-browser-shaped requests.
+
+    sample_bytes: how many bytes to grab (default 5MB) to avoid pulling
+    a whole album per call. Result reports MB/s; <0.5 MB/s likely means
+    we're being throttled regardless of headers.
+    """
+    if controller.is_running():
+        return {"error": "bandcampsync container is running"}
+    return await asyncio.to_thread(
+        _test_browser_headers_sync, item_id, sample_bytes,
+    )
+
+
+def _test_browser_headers_sync(item_id: int | None, sample_bytes: int) -> dict:
+    from bandcampsync.bandcamp import Bandcamp  # type: ignore
+
+    cookies_path = Path(settings.config_view_path) / "cookies.txt"
+    if not cookies_path.exists():
+        return {"error": "cookies.txt missing"}
+    try:
+        bc = Bandcamp(cookies_path.read_text(errors="replace"))
+        bc.verify_authentication()
+        bc.load_purchases()
+    except Exception as e:
+        return {"error": f"bandcampsync init: {type(e).__name__}: {e}"}
+
+    target = None
+    if item_id is not None:
+        target = next((p for p in bc.purchases if p.item_id == item_id), None)
+    elif bc.purchases:
+        target = bc.purchases[0]
+    if target is None:
+        return {"error": "no purchase to test"}
+
+    try:
+        signed_url = bc.get_download_file_url(target, encoding="flac")
+    except Exception as e:
+        return {"error": f"URL: {type(e).__name__}: {e}"}
+    if not signed_url:
+        return {"error": "URL resolution returned empty"}
+
+    # The page that would normally have linked to this download.
+    referer = getattr(target, "download_url", "") or "https://bandcamp.com/"
+
+    cookies = {}
+    for line in cookies_path.read_text(errors="replace").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7 and "bandcamp.com" in parts[0]:
+            cookies[parts[5]] = parts[6]
+
+    # ----- variant A: minimal headers (what bandcampsync does) -----
+    a_result = _measure_throughput(
+        signed_url, headers={}, cookies=cookies, sample_bytes=sample_bytes,
+        impersonate="chrome",
+    )
+    a_result["variant"] = "minimal_chrome_impersonate"
+
+    # ----- variant B: full browser headers + referer -----
+    full_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not.A/Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": referer,
+        "Connection": "keep-alive",
+    }
+    b_result = _measure_throughput(
+        signed_url, headers=full_headers, cookies=cookies,
+        sample_bytes=sample_bytes, impersonate="chrome",
+    )
+    b_result["variant"] = "full_browser_headers_with_referer"
+
+    return {
+        "item_id": target.item_id,
+        "band_name": target.band_name,
+        "item_title": target.item_title,
+        "referer_used": referer,
+        "sample_bytes_target": sample_bytes,
+        "results": [a_result, b_result],
+    }
+
+
+def _measure_throughput(
+    url: str, headers: dict, cookies: dict, sample_bytes: int,
+    impersonate: str = "chrome",
+) -> dict:
+    import time as _time
+    start = _time.time()
+    bytes_dl = 0
+    http_status = None
+    error = None
+    first_chunk_after = None
+    try:
+        with curl_requests.Session(impersonate=impersonate) as s:
+            r = s.get(
+                url, headers=headers, cookies=cookies,
+                stream=True, timeout=120,
+            )
+            http_status = r.status_code
+            if r.status_code != 200:
+                return {
+                    "status": "fail",
+                    "http_status": r.status_code,
+                    "duration_seconds": round(_time.time() - start, 2),
+                    "bytes": 0,
+                    "error": f"HTTP {r.status_code}",
+                }
+            for chunk in r.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    if first_chunk_after is None:
+                        first_chunk_after = round(_time.time() - start, 2)
+                    bytes_dl += len(chunk)
+                    if bytes_dl >= sample_bytes:
+                        break
+                if _time.time() - start > 120:
+                    break
+            r.close()
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+
+    duration = max(0.001, _time.time() - start)
+    return {
+        "status": "ok" if not error and bytes_dl > 0 else "fail",
+        "http_status": http_status,
+        "duration_seconds": round(duration, 2),
+        "first_chunk_after_seconds": first_chunk_after,
+        "bytes": bytes_dl,
+        "mbps": round((bytes_dl * 8 / 1_000_000) / duration, 2),
+        "MB_per_s": round((bytes_dl / 1_000_000) / duration, 2),
+        "error": error,
+    }
+
+
 @app.post("/test-sidecar-download")
 async def test_sidecar_download(
     item_id: int | None = None, count: int = 1,
