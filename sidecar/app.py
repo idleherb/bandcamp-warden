@@ -1169,6 +1169,24 @@ class Orchestrator:
             msg = (
                 f"❌ *Start fehlgeschlagen*\n```\n{summary.last_error}\n```"
             )
+        elif summary.stop_reason == "circuit_break":
+            # N consecutive failures — likely Bandcamp throttle. Don't
+            # keep hammering. Mark today as crashed so the auto-retry
+            # logic backs off, and surface the issue loudly.
+            self.state.update_run(
+                run_date, downloaded=downloaded_today, status="crashed",
+                stop_reason="circuit breaker (consecutive failures)",
+                finished_at=finished_at,
+            )
+            msg = (
+                f"⛔ *Circuit Breaker* (`{run_date}`)\n"
+                f"Mehrere Alben hintereinander gescheitert. "
+                f"Heute: *{downloaded_today}*/{quota}, "
+                f"Gesamt: *{final}*.\n"
+                f"Letzter Fehler: `{(summary.last_error or '')[:200]}`\n\n"
+                f"Bandcamp drosselt vermutlich. "
+                f"Auto-Retry pausiert, nächster Versuch erst morgen 03:00."
+            )
         else:
             # Reached end of purchase list without hitting quota.
             self.state.update_run(

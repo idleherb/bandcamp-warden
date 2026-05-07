@@ -143,6 +143,7 @@ class WardenDownloader:
         max_resumes_per_album: int = 30,
         resume_delay_seconds: float = 10.0,
         between_albums_seconds: float = 5.0,
+        max_consecutive_failures: int = 3,
     ) -> None:
         self.downloads_root = downloads_root
         self.config_dir = config_dir
@@ -158,6 +159,7 @@ class WardenDownloader:
         self.max_resumes_per_album = max_resumes_per_album
         self.resume_delay_seconds = resume_delay_seconds
         self.between_albums_seconds = between_albums_seconds
+        self.max_consecutive_failures = max_consecutive_failures
         # Cancellation flag. Set externally (e.g. from /stop) to break
         # out between albums; an in-flight download will continue until
         # the current attempt finishes or its read-timeout fires.
@@ -198,6 +200,7 @@ class WardenDownloader:
         skipped = 0
         stop_reason = "completed_loop"
         last_error: str | None = None
+        consecutive_failures: int | None = 0
 
         _log = log_event or (lambda s: None)
         _log(
@@ -242,13 +245,22 @@ class WardenDownloader:
                 successes.append(outcome)
                 completed_ids.add(iid)
                 self._append_ignore(iid, band, title)
+                consecutive_failures = 0
             else:
                 failures.append(outcome)
                 last_error = outcome.error
-                # Don't keep trying if we hit a hard auth issue; a
-                # series of these is exactly the ban-precursor we want
-                # to bail on. The orchestrator's anomaly detection
-                # observes log_event output, so it'll see and brake.
+                consecutive_failures = (
+                    1 if consecutive_failures is None
+                    else consecutive_failures + 1
+                )
+                if consecutive_failures >= self.max_consecutive_failures:
+                    _log(
+                        f"  ⛔ {consecutive_failures} consecutive failures — "
+                        f"circuit breaker tripped, bailing out of run "
+                        f"to protect the account"
+                    )
+                    stop_reason = "circuit_break"
+                    break
 
             await asyncio.sleep(self.between_albums_seconds)
 
