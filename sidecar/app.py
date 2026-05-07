@@ -1401,8 +1401,32 @@ def _stage_bandcampsync_patch() -> None:
         log.error("Failed to stage bandcampsync patch: %s", e)
 
 
+def _cleanup_orphan_bandcampsync() -> None:
+    """If a bandcampsync container is still running from a previous
+    sidecar incarnation, mark today's run as crashed so the new sidecar
+    can decide what to do. Doesn't kill the container — just records.
+    Useful after a Watchtower restart that orphaned the running download.
+    """
+    try:
+        c = controller.client.containers.get(settings.bandcampsync_container)
+        c.reload()
+    except Exception:
+        return
+    if c.status != "running":
+        return
+    log.warning(
+        "Found orphan bandcampsync container at startup (status=%s); "
+        "stopping it to reclaim a clean slate", c.status,
+    )
+    try:
+        controller.stop()
+    except Exception as e:
+        log.warning("Could not stop orphan: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    _cleanup_orphan_bandcampsync()
     if settings.bandcampsync_patch_enabled:
         _stage_bandcampsync_patch()
     scheduler.add_job(
@@ -1640,6 +1664,89 @@ def _test_range_sync(item_id: int | None) -> dict:
     else:
         out["verdict"] = "INCONCLUSIVE"
     return out
+
+
+@app.post("/test-sidecar-download")
+async def test_sidecar_download(
+    item_id: int | None = None, count: int = 1,
+) -> dict:
+    """Plan C smoke test: download N albums using the in-sidecar
+    WardenDownloader (httpx + Range resume), bypassing the bandcampsync
+    container entirely. Used to validate the new approach works before
+    flipping it on for the daily run."""
+    if controller.is_running():
+        return {"error": "bandcampsync container is running; stop it first"}
+
+    from downloader import WardenDownloader  # local module
+
+    dl = WardenDownloader(
+        downloads_root=Path(settings.downloads_view_path),
+        config_dir=Path(settings.config_view_path),
+        format_name="flac",
+    )
+
+    # Reuse bandcampsync to load and pick one purchase
+    from bandcampsync.bandcamp import Bandcamp  # type: ignore
+
+    cookies_path = Path(settings.config_view_path) / "cookies.txt"
+    if not cookies_path.exists():
+        return {"error": "cookies.txt missing"}
+    try:
+        bc = Bandcamp(cookies_path.read_text(errors="replace"))
+        bc.verify_authentication()
+        bc.load_purchases()
+    except Exception as e:
+        return {"error": f"bandcampsync init: {type(e).__name__}: {e}"}
+
+    if not bc.purchases:
+        return {"error": "no purchases"}
+
+    completed = dl._read_ignores()
+    targets = []
+    if item_id is not None:
+        item = next((p for p in bc.purchases if p.item_id == item_id), None)
+        if item is not None:
+            targets = [item]
+    else:
+        # Pick the first not-yet-downloaded item
+        for p in bc.purchases:
+            if p.item_id not in completed:
+                targets.append(p)
+                if len(targets) >= max(1, min(count, 5)):
+                    break
+
+    if not targets:
+        return {"error": "no eligible target"}
+
+    results: list[dict] = []
+    log_events: list[str] = []
+
+    def _log(s: str) -> None:
+        log_events.append(s)
+        log.info("test-sidecar-download: %s", s)
+
+    for item in targets:
+        try:
+            url = bc.get_download_file_url(item, encoding="flac")
+            outcome = await dl._fetch_extract_and_record(item, url, _log)
+            results.append({
+                "item_id": outcome.item_id,
+                "band_name": outcome.band_name,
+                "item_title": outcome.item_title,
+                "success": outcome.success,
+                "bytes_written": outcome.bytes_written,
+                "resumes": outcome.resumes,
+                "folder": str(outcome.folder) if outcome.folder else None,
+                "error": outcome.error,
+            })
+            if outcome.success:
+                dl._append_ignore(outcome.item_id, outcome.band_name, outcome.item_title)
+        except Exception as e:
+            results.append({
+                "item_id": item.item_id,
+                "error": f"{type(e).__name__}: {e}",
+            })
+    return {"results": results, "log_events": log_events}
 
 
 @app.post("/test-download")

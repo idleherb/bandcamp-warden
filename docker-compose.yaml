@@ -60,10 +60,12 @@ services:
       # writes the FLACs themselves under the same mount.
       - ${HOST_DOWNLOADS_PATH:-/mnt/storage/media/bandcamp}:/downloads
 
-      # Read-only view of bandcampsync's config dir so the sidecar can parse
-      # cookies.txt (for expiry monitoring + extracting fan_id for the
-      # Bandcamp Fan API) and ignores.txt (for the completion counter).
-      - ${HOST_CONFIG_PATH:-/mnt/apps/bandcamp-warden/config}:/config:ro
+      # Bandcampsync's config dir. Sidecar needs RW because Plan C
+      # (in-sidecar downloader) appends item ids to ignores.txt directly.
+      # Read-only on the bandcampsync side is enforced by NOT running it
+      # while Plan C is active (the test endpoint refuses to run if
+      # bandcampsync container is up).
+      - ${HOST_CONFIG_PATH:-/mnt/apps/bandcamp-warden/config}:/config
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz',timeout=3).status==200 else 1)"]
       interval: 30s
