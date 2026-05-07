@@ -9,8 +9,7 @@ apscheduler==3.10.4
 # de-duplication. We use the same library the bandcampsync container
 # uses, so identical behaviour. curl_cffi comes in transitively.
 bandcampsync==0.7.0
-# Playwright (Plan D) is opt-in: only used by the test endpoint.
-# Not installed by default to keep image small. To enable:
-#   1. uncomment the line below
-#   2. add Chromium/Firefox apt deps + `python -m playwright install` to Dockerfile
-# playwright==1.50.0
+# Playwright (Plan D) — needed because Bandcamp's CDN throttles
+# non-browser HTTP clients regardless of TLS+headers+cookies. Real
+# browser execution (JS, canvas fingerprint, etc.) bypasses this.
+playwright==1.50.0

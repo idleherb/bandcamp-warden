@@ -145,6 +145,7 @@ class BrowserDownloader:
         self,
         downloads_root: Path,
         config_dir: Path,
+        state_dir: Path | None = None,
         format_name: str = "flac",
         between_albums_min_s: float = 5.0,
         between_albums_max_s: float = 15.0,
@@ -153,6 +154,10 @@ class BrowserDownloader:
     ) -> None:
         self.downloads_root = downloads_root
         self.config_dir = config_dir
+        # state_dir is the always-RW sidecar volume. If /config is
+        # mounted RO (legacy compose), we still write the warden ignores
+        # file to /state and read both at startup.
+        self.state_dir = state_dir
         self.format_name = format_name
         self.between_min = between_albums_min_s
         self.between_max = between_albums_max_s
@@ -187,7 +192,7 @@ class BrowserDownloader:
     async def download_one(
         self,
         item,  # bandcampsync BandcampItem
-        browser_name: str = "chromium",
+        browser_name: str = "firefox",
         log_event: Callable[[str], None] | None = None,
     ) -> BrowserDownloadOutcome:
         """Drive a real browser to download one album and save it under
@@ -285,6 +290,21 @@ class BrowserDownloader:
                     shutil.move(str(tmp_path), album_dir / fname)
                     _log(f"single-track moved to {fname}")
 
+                # Verify at least one audio file exists post-extract.
+                audio_exts = {".flac", ".mp3", ".wav", ".aiff", ".alac", ".ogg"}
+                audio_count = sum(
+                    1 for p in album_dir.rglob("*")
+                    if p.is_file() and p.suffix.lower() in audio_exts
+                )
+                if audio_count == 0:
+                    return BrowserDownloadOutcome(
+                        success=False, item_id=iid, band_name=band, item_title=title,
+                        folder=album_dir, bytes_written=size,
+                        duration_seconds=datetime.now(timezone.utc).timestamp() - start_ts,
+                        browser_used=browser_name,
+                        error="no audio files after extract",
+                    )
+
                 # Record success in ignores.txt for the existing counter.
                 self._append_ignore(iid, band, title)
 
@@ -316,13 +336,22 @@ class BrowserDownloader:
                     shutil.copyfileobj(src, out)
 
     def _append_ignore(self, item_id: int, band: str, title: str) -> None:
-        path = self.config_dir / "ignores.txt"
         line = f"{item_id}  # {band} / {title}\n"
-        try:
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line)
-        except Exception as e:
-            log.warning("failed to append ignores.txt: %s", e)
+        # Try /config first (bandcampsync convention). If RO, fall
+        # back to /state.
+        candidates = [self.config_dir / "ignores.txt"]
+        if self.state_dir is not None:
+            candidates.append(self.state_dir / "ignores_warden.txt")
+        for path in candidates:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line)
+                return
+            except Exception as e:
+                log.warning("append %s failed: %s", path, e)
+                continue
+        log.error("could not append ignore for item %d", item_id)
 
 
 def _looks_like_zip(p: Path) -> bool:

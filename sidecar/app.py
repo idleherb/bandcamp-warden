@@ -2031,7 +2031,7 @@ def _test_range_sync(item_id: int | None) -> dict:
 @app.post("/test-browser-download")
 async def test_browser_download(
     item_id: int | None = None,
-    browser: str = "chromium",
+    browser: str = "firefox",
 ) -> dict:
     """Plan D smoke test: download ONE album using a real Playwright
     browser (chromium or firefox). The user proved their browser
@@ -2082,6 +2082,7 @@ async def test_browser_download(
     bd = BrowserDownloader(
         downloads_root=Path(settings.downloads_view_path),
         config_dir=Path(settings.config_view_path),
+        state_dir=Path(settings.state_path),
         format_name="flac",
     )
     outcome = await bd.download_one(target, browser_name=browser, log_event=_log)
