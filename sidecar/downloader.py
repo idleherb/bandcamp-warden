@@ -28,6 +28,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import threading
@@ -161,6 +162,57 @@ class WardenDownloader:
         # the current attempt finishes or its read-timeout fires.
         self.cancel_requested = False
 
+    # ----- helpers -----
+
+    def _read_cookie_jar(self) -> dict[str, str]:
+        """Parse cookies.txt into a name→value dict scoped to bandcamp.com."""
+        out: dict[str, str] = {}
+        path = self.config_dir / "cookies.txt"
+        if not path.exists():
+            return out
+        for line in path.read_text(errors="replace").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7 and "bandcamp.com" in parts[0]:
+                out[parts[5]] = parts[6]
+        return out
+
+    async def _warmup_browse(
+        self,
+        item_url: str,
+        cookie_jar: dict[str, str],
+        log_event: Callable[[str], None],
+    ) -> None:
+        """Visit the album's bandcamp page (e.g.
+        valyri.bandcamp.com/album/saturnfall) before kicking off the
+        download. Mimics a real user clicking into the album. We
+        discard the response body — we only need Bandcamp's session-
+        side state to register the visit."""
+        delay = random.uniform(3.0, 8.0)
+        log_event(f"  ⋯ warmup-browse {item_url[:80]} (delay {delay:.1f}s)")
+        await asyncio.sleep(delay)
+
+        def _do_get() -> tuple[int | None, int]:
+            try:
+                with curl_requests.Session(
+                    impersonate=_BROWSER_IMPERSONATE,
+                ) as s:
+                    headers = dict(_BROWSER_HEADERS)
+                    headers["Referer"] = "https://bandcamp.com/"
+                    r = s.get(
+                        item_url, headers=headers, cookies=cookie_jar,
+                        timeout=30,
+                    )
+                    body = r.content or b""
+                    r.close()
+                    return r.status_code, len(body)
+            except Exception as e:
+                return None, 0
+
+        status, body_len = await asyncio.to_thread(_do_get)
+        log_event(f"  ⋯ warmup status={status} body={body_len} bytes")
+
     # ----- public entry point -----
 
     async def run_daily(
@@ -204,6 +256,9 @@ class WardenDownloader:
             f"{len(completed_ids)} already done, quota={quota}"
         )
 
+        # Cookie jar for warmup browse + downloads. Loaded once.
+        cookie_jar = self._read_cookie_jar()
+
         for item in bc.purchases:
             if self.cancel_requested:
                 stop_reason = "cancelled"
@@ -220,6 +275,19 @@ class WardenDownloader:
             title = (item.item_title or "?")
             _log(f"→ {band} / {title} (id:{iid})")
 
+            # Warmup browse — GET the album's main page like a human
+            # who clicked into the album before downloading. Real users
+            # navigate album-page → download-page → cdn-fetch; bandcampsync
+            # by default jumps straight from API to cdn-fetch, missing
+            # the album-page step. Bandcamp's anti-bot may flag the
+            # short sequence as bot-like; the warmup smooths it out.
+            item_url = getattr(item, "item_url", None) or item._data.get("item_url")
+            if item_url:
+                try:
+                    await self._warmup_browse(item_url, cookie_jar, _log)
+                except Exception as e:
+                    _log(f"  ! warmup browse failed (non-fatal): {e}")
+
             try:
                 signed_url = bc.get_download_file_url(item, encoding=self.format_name)
                 if not signed_url:
@@ -235,7 +303,7 @@ class WardenDownloader:
                 continue
 
             outcome = await self._fetch_extract_and_record(
-                item, signed_url, log_event=_log,
+                item, signed_url, log_event=_log, cookie_jar=cookie_jar,
             )
             if outcome.success:
                 successes.append(outcome)
@@ -282,10 +350,20 @@ class WardenDownloader:
         item,
         signed_url: str,
         log_event: Callable[[str], None],
+        cookie_jar: dict[str, str] | None = None,
     ) -> DownloadOutcome:
         iid = item.item_id
         band = item.band_name or "?"
         title = item.item_title or "?"
+        # Per-item Referer matches what a real browser would send: the
+        # bandcamp.com/download?... page where the user clicked the
+        # FLAC link.  Static `bandcamp.com/` Referer (our previous
+        # default) is detectable as bot-like.
+        referer = (
+            getattr(item, "download_url", None)
+            or item._data.get("download_url")
+            or "https://bandcamp.com/"
+        )
 
         import time as _time
         dl_started = _time.time()
@@ -294,6 +372,7 @@ class WardenDownloader:
             try:
                 bytes_written, resumes, content_type = await self._stream_to_file(
                     signed_url, tmp_zip, log_event,
+                    cookie_jar=cookie_jar, referer=referer,
                 )
             except Exception as e:
                 err = f"download: {type(e).__name__}: {e}"
@@ -368,23 +447,28 @@ class WardenDownloader:
         url: str,
         path: Path,
         log_event: Callable[[str], None],
+        cookie_jar: dict[str, str] | None = None,
+        referer: str | None = None,
     ) -> tuple[int, int, str]:
         """Stream `url` to `path` with Range-resume on stall.
 
-        Uses curl_cffi.Session(impersonate="chrome") because Bandcamp's
-        CDN appears to TLS-fingerprint clients in addition to checking
-        request headers; httpx with all the right headers still gets
-        throttled (validated empirically: same headers via httpx hung
-        for 10 minutes, via curl_cffi got 1.44 MB/s on the same URL).
+        Uses curl_cffi.Session(impersonate="firefox133") because Bandcamp's
+        CDN TLS-fingerprints clients in addition to checking headers.
+        cookie_jar carries the user's bandcamp cookies; referer should be
+        the bandcamp.com/download?... page so the request looks like a
+        click from there (rather than navigation from bandcamp.com root).
 
         Runs in a thread because curl_cffi's API is sync.
         """
         return await asyncio.to_thread(
             self._stream_to_file_sync, url, path, log_event,
+            cookie_jar, referer,
         )
 
     def _stream_to_file_sync(
         self, url: str, path: Path, log_event: Callable[[str], None],
+        cookie_jar: dict[str, str] | None = None,
+        referer: str | None = None,
     ) -> tuple[int, int, str]:
         bytes_written = 0
         resumes = 0
@@ -401,6 +485,8 @@ class WardenDownloader:
         with path.open("ab") as fh:
             while True:
                 headers: dict[str, str] = dict(_BROWSER_HEADERS)
+                if referer:
+                    headers["Referer"] = referer
                 is_resume = bytes_written > 0
                 if is_resume:
                     headers["Range"] = f"bytes={bytes_written}-"
@@ -415,6 +501,7 @@ class WardenDownloader:
                     ) as session:
                         r = session.get(
                             url, headers=headers, stream=True,
+                            cookies=cookie_jar or None,
                             timeout=self.connect_timeout + self.read_timeout,
                         )
 
