@@ -1717,6 +1717,114 @@ async def reset_completion() -> dict:
     return {"reset": True}
 
 
+@app.post("/cleanup-stale-ignores")
+async def cleanup_stale_ignores(dry_run: bool = True) -> dict:
+    """Resync ignores.txt with what's actually downloaded.
+
+    Walks every '<id>  # band / title' line in the bandcampsync
+    /config/ignores.txt and the warden /state/ignores_warden.txt.
+    Looks up the corresponding album folder under /downloads using
+    the same normalize() rule as the metadata enricher. If the folder
+    doesn't exist or contains zero audio files (FLAC/MP3/etc.), the
+    line is stale: bandcampsync wrote it but the album is incomplete.
+
+    dry_run=true: report only. dry_run=false: rewrite the files,
+    removing stale entries so the next daily run picks them up again.
+    """
+    return await asyncio.to_thread(_cleanup_stale_ignores_sync, dry_run)
+
+
+def _cleanup_stale_ignores_sync(dry_run: bool) -> dict:
+    import unicodedata as _ud
+
+    _disallowed = '"#%\'*/?\\`:'
+
+    def _norm(s: str) -> str:
+        s = _ud.normalize("NFKD", s or "")
+        s = "".join(c for c in s if c not in _disallowed)
+        s = "".join(
+            c for c in s
+            if _ud.category(c) not in ("Cf", "Mn", "Cc")
+        )
+        s = re.sub(r"\s+", " ", s).strip().rstrip(". ").lower()
+        return s
+
+    audio_exts = {".flac", ".mp3", ".wav", ".aiff", ".alac", ".ogg"}
+    downloads = Path(settings.downloads_view_path)
+
+    # Index actual album dirs by (norm_band, norm_title) → has_audio?
+    folder_status: dict[tuple[str, str], bool] = {}
+    if downloads.exists():
+        for artist_dir in downloads.iterdir():
+            if not artist_dir.is_dir():
+                continue
+            for album_dir in artist_dir.iterdir():
+                if not album_dir.is_dir():
+                    continue
+                has_audio = any(
+                    p.suffix.lower() in audio_exts
+                    for p in album_dir.rglob("*") if p.is_file()
+                )
+                folder_status[(_norm(artist_dir.name), _norm(album_dir.name))] = has_audio
+
+    # Process each ignores file independently.
+    candidate_paths = [
+        Path(settings.config_view_path) / "ignores.txt",
+        Path(settings.state_path) / "ignores_warden.txt",
+    ]
+    per_file: list[dict] = []
+    total_stale = 0
+    line_re = re.compile(r"^\s*(\d+)\s*#\s*(.+?)\s*/\s*(.+?)\s*$")
+
+    for path in candidate_paths:
+        if not path.exists():
+            per_file.append({"path": str(path), "exists": False})
+            continue
+        original_lines = path.read_text(errors="replace").splitlines(keepends=True)
+        kept: list[str] = []
+        stale: list[dict] = []
+        for line in original_lines:
+            m = line_re.match(line)
+            if not m:
+                kept.append(line)
+                continue
+            iid = int(m.group(1))
+            band = m.group(2)
+            title = m.group(3)
+            key = (_norm(band), _norm(title))
+            ok = folder_status.get(key, False)
+            if ok:
+                kept.append(line)
+            else:
+                stale.append({
+                    "item_id": iid, "band": band, "item_title": title,
+                    "folder_known": key in folder_status,
+                })
+        per_file.append({
+            "path": str(path),
+            "exists": True,
+            "total_lines": len(original_lines),
+            "stale_count": len(stale),
+            "stale_examples": stale[:10],
+        })
+        total_stale += len(stale)
+        if not dry_run and stale:
+            try:
+                # Atomic rewrite: write to .tmp then rename.
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                tmp.write_text("".join(kept), encoding="utf-8")
+                os.replace(tmp, path)
+                per_file[-1]["rewrote"] = True
+            except Exception as e:
+                per_file[-1]["rewrite_error"] = f"{type(e).__name__}: {e}"
+
+    return {
+        "dry_run": dry_run,
+        "total_stale": total_stale,
+        "files": per_file,
+    }
+
+
 @app.get("/sample-metadata")
 async def sample_metadata(count: int = 5) -> dict:
     """Read up to N bandcamp_<id>.json files from /downloads and return

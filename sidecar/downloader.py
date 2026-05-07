@@ -331,7 +331,31 @@ class WardenDownloader:
                     error=err,
                 )
 
-        log_event(f"  ✓ done ({bytes_written} bytes, {resumes} resumes)")
+            # Verify extract actually produced audio files. bandcampsync
+            # had a long-standing bug here: it would write item_id to
+            # ignores.txt even if the unzip produced an empty folder
+            # (corrupt zip, exception mid-move, etc.), making a 're-
+            # download all the broken ones' impossible without manually
+            # editing ignores.txt. We refuse to mark an album as done
+            # unless at least one audio file is on disk.
+            audio_extensions = {".flac", ".mp3", ".wav", ".aiff", ".alac", ".ogg"}
+            files_with_audio = [
+                p for p in album_dir.rglob("*")
+                if p.is_file() and p.suffix.lower() in audio_extensions
+            ]
+            if not files_with_audio:
+                err = "no audio files in album dir after extract"
+                log_event(f"  ✗ {err}")
+                return DownloadOutcome(
+                    success=False, item_id=iid, band_name=band, item_title=title,
+                    folder=album_dir, bytes_written=bytes_written, resumes=resumes,
+                    error=err,
+                )
+
+        log_event(
+            f"  ✓ done ({bytes_written} bytes, {resumes} resumes, "
+            f"{len(files_with_audio)} audio files)"
+        )
         return DownloadOutcome(
             success=True, item_id=iid, band_name=band, item_title=title,
             folder=album_dir, bytes_written=bytes_written, resumes=resumes,
