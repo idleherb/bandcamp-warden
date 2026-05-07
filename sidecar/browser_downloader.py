@@ -236,39 +236,73 @@ class BrowserDownloader:
             _log(f"navigate → {page_url}")
             await page.goto(page_url, wait_until="domcontentloaded")
 
-            # Bandcamp's download page lists encodings as radio + a
-            # "Download" link. Pick the FLAC option, then click.
-            # The page sometimes pre-selects mp3-v0; we change first.
-            #
-            # The selector below was the one the official site used in
-            # mid-2025; if Bandcamp redesigns, this is the brittle bit.
-            try:
-                # Click the format selector dropdown.
-                await page.click("button.fmt-toggle", timeout=15000)
-            except PlaywrightTimeoutError:
-                # Some pages use a <select> instead of toggle button.
-                pass
-
-            # Try to pick FLAC by visible text.
-            try:
-                await page.click(
-                    "ul.fmt-list >> text=/^FLAC/i", timeout=10000,
+            # Bandcamp's download page embeds the signed URLs for every
+            # encoding as <a href="https://popplers5.bandcamp.com/download
+            # /album?enc=...&id=...&sig=...">. We don't care about the
+            # UI selector layout (which has changed multiple times) —
+            # we just find the FLAC link by URL pattern via JS-eval.
+            await page.wait_for_load_state("networkidle", timeout=30000)
+            flac_href = await page.evaluate(
+                """
+                () => {
+                    const links = Array.from(document.querySelectorAll('a'));
+                    const flac = links.find(
+                        a => a.href && a.href.includes('enc=' + 'flac')
+                    );
+                    return flac ? flac.href : null;
+                }
+                """
+            )
+            if not flac_href:
+                # Fall back: look in any embedded JSON blob for a flac url.
+                flac_href = await page.evaluate(
+                    """
+                    () => {
+                        const blobs = Array.from(document.querySelectorAll('[data-blob]'));
+                        for (const b of blobs) {
+                            try {
+                                const t = b.getAttribute('data-blob');
+                                const m = t.match(
+                                    /https?:\\\\?\\/\\\\?\\/popplers[0-9]+\\.bandcamp\\.com\\\\?\\/download[^"\\\\]*enc=flac[^"\\\\]*/
+                                );
+                                if (m) return m[0].replace(/\\\\\\//g, '/');
+                            } catch (e) {}
+                        }
+                        return null;
+                    }
+                    """
                 )
-                _log("FLAC selected")
-            except PlaywrightTimeoutError:
-                _log("could not click FLAC menu — assuming default")
 
-            # Wait for the download link to be clickable.
-            dl_button_selector = "a.item-button:has-text('Download')"
-            await page.wait_for_selector(dl_button_selector, timeout=15000)
+            if not flac_href:
+                # Last resort: dump page content shape for debug.
+                title_text = await page.title()
+                html_len = len(await page.content())
+                raise RuntimeError(
+                    f"no flac link found on page (title={title_text!r}, "
+                    f"html={html_len} bytes)"
+                )
 
-            # Trigger the download.
+            _log(f"flac url: {flac_href[:90]}...")
+
+            # Trigger the download by navigating to the signed URL.
+            # Playwright's expect_download intercepts the response.
             with TemporaryDirectory(prefix="warden_browser_") as td:
                 td_path = Path(td)
                 async with page.expect_download(
                     timeout=self.download_timeout * 1000,
                 ) as dl_info:
-                    await page.click(dl_button_selector)
+                    # JS click avoids cross-origin navigation block on
+                    # the popplers5.bandcamp.com URL.
+                    await page.evaluate(
+                        """(href) => {
+                            const a = document.createElement('a');
+                            a.href = href;
+                            a.download = '';
+                            document.body.appendChild(a);
+                            a.click();
+                        }""",
+                        flac_href,
+                    )
                 download = await dl_info.value
                 _log(f"download started: {download.suggested_filename}")
                 tmp_path = td_path / "album.bin"
