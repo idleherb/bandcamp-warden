@@ -9,3 +9,7 @@ apscheduler==3.10.4
 # de-duplication. We use the same library the bandcampsync container
 # uses, so identical behaviour. curl_cffi comes in transitively.
 bandcampsync==0.7.0
+# Playwright for browser-driven downloads (Plan D). Pulled because
+# Bandcamp throttles non-browser HTTP clients to 0 B/s session-wide.
+# Chromium + Firefox installed in Dockerfile via `playwright install`.
+playwright==1.50.0

@@ -1666,6 +1666,81 @@ def _test_range_sync(item_id: int | None) -> dict:
     return out
 
 
+@app.post("/test-browser-download")
+async def test_browser_download(
+    item_id: int | None = None,
+    browser: str = "chromium",
+) -> dict:
+    """Plan D smoke test: download ONE album using a real Playwright
+    browser (chromium or firefox). The user proved their browser
+    downloads fast while our HTTP scripts get throttled to 0 — this
+    validates whether automating a real browser also gets fast
+    download speeds, or whether Bandcamp also detects Playwright."""
+    if controller.is_running():
+        return {"error": "bandcampsync container is running"}
+
+    from bandcampsync.bandcamp import Bandcamp  # type: ignore
+    from browser_downloader import BrowserDownloader
+
+    cookies_path = Path(settings.config_view_path) / "cookies.txt"
+    if not cookies_path.exists():
+        return {"error": "cookies.txt missing"}
+    try:
+        bc = Bandcamp(cookies_path.read_text(errors="replace"))
+        bc.verify_authentication()
+        bc.load_purchases()
+    except Exception as e:
+        return {"error": f"bandcampsync init: {type(e).__name__}: {e}"}
+
+    target = None
+    if item_id is not None:
+        target = next((p for p in bc.purchases if p.item_id == item_id), None)
+    else:
+        # First not-yet-downloaded item.
+        completed = set()
+        ig = Path(settings.config_view_path) / "ignores.txt"
+        if ig.exists():
+            for line in ig.read_text(errors="replace").splitlines():
+                stripped = line.split("#", 1)[0].strip()
+                if stripped.isdigit():
+                    completed.add(int(stripped))
+        for p in bc.purchases:
+            if p.item_id not in completed:
+                target = p
+                break
+    if target is None:
+        return {"error": "no eligible target"}
+
+    log_events: list[str] = []
+
+    def _log(s: str) -> None:
+        log_events.append(s)
+        log.info("test-browser-download: %s", s)
+
+    bd = BrowserDownloader(
+        downloads_root=Path(settings.downloads_view_path),
+        config_dir=Path(settings.config_view_path),
+        format_name="flac",
+    )
+    outcome = await bd.download_one(target, browser_name=browser, log_event=_log)
+    return {
+        "success": outcome.success,
+        "item_id": outcome.item_id,
+        "band_name": outcome.band_name,
+        "item_title": outcome.item_title,
+        "bytes_written": outcome.bytes_written,
+        "duration_seconds": round(outcome.duration_seconds, 2),
+        "MB_per_s": (
+            round((outcome.bytes_written / 1_000_000) / outcome.duration_seconds, 2)
+            if outcome.duration_seconds > 0 else None
+        ),
+        "folder": str(outcome.folder) if outcome.folder else None,
+        "browser_used": outcome.browser_used,
+        "error": outcome.error,
+        "log_events": log_events,
+    }
+
+
 @app.post("/test-browser-headers")
 async def test_browser_headers(
     item_id: int | None = None, sample_bytes: int = 5_000_000,
