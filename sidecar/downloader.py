@@ -234,6 +234,16 @@ class WardenDownloader:
 
         try:
             bc = Bandcamp(cookies_path.read_text(errors="replace"))
+            # bandcampsync defaults to impersonate="chrome" for its
+            # internal session. We use firefox133 everywhere else
+            # (warmup browse + actual download). Mismatched
+            # impersonation profiles within the same logical user
+            # session are themselves a fingerprint Bandcamp could
+            # use. Replace bc.session so all of our requests look
+            # like the same Firefox.
+            bc.session = curl_requests.Session(impersonate=_BROWSER_IMPERSONATE)
+            for cookie_name, morsel in bc.cookies.items():
+                bc.session.cookies.set(cookie_name, morsel.value)
             bc.verify_authentication()
             bc.load_purchases()
         except Exception as e:
