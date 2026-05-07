@@ -47,35 +47,31 @@ from curl_cffi.const import CurlOpt
 log = logging.getLogger("warden.downloader")
 
 
-# Empirically validated (see /test-browser-headers): Bandcamp's CDN
-# throttles non-browser-shaped requests to ~0.28 MB/s but serves
-# browser-shaped requests at 1.44+ MB/s. So every download request
-# from this module sends the same headers a real Chrome navigation
-# would emit. Referer is a generic bandcamp.com URL — per-album
-# Referer would be marginally better but requires more plumbing.
+# Mimic the user's Firefox browser exactly — that's the configuration
+# they proved gets full bandwidth from Bandcamp (120MB album in 2 s
+# locally). curl_cffi's impersonate="firefox133" handles TLS fingerprint
+# + HTTP/2 settings; we add Firefox-specific headers (DNT, Sec-GPC,
+# Priority — none of which Chrome sends) so the request is consistent
+# end-to-end. User-Agent is left to impersonate's default so it matches
+# the TLS fingerprint version automatically.
+_BROWSER_IMPERSONATE = "firefox133"
 _BROWSER_HEADERS = {
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
+        "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8"
     ),
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Language": "en-US,en;q=0.5",
     "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Sec-Ch-Ua": (
-        '"Chromium";v="124", "Google Chrome";v="124", "Not.A/Brand";v="99"'
-    ),
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"macOS"',
+    "DNT": "1",
+    "Sec-GPC": "1",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "same-site",
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
+    "Priority": "u=0, i",
     "Referer": "https://bandcamp.com/",
     "Connection": "keep-alive",
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
 }
 
 
@@ -387,7 +383,7 @@ class WardenDownloader:
 
                 try:
                     with curl_requests.Session(
-                        impersonate="chrome",
+                        impersonate=_BROWSER_IMPERSONATE,
                         curl_options={
                             CurlOpt.LOW_SPEED_TIME: 60,
                             CurlOpt.LOW_SPEED_LIMIT: 1024,

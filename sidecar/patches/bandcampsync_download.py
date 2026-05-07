@@ -59,35 +59,29 @@ _PATIENT_OPTIONS = {
 }
 
 
-# Browser-faithful request shape. Empirical finding from
-# /test-browser-headers (commit bfcb7ff): Bandcamp's CDN throttles
-# requests that lack the headers a real browser navigation would send.
-# Variant comparison on the same signed URL:
-#   * minimal_chrome_impersonate (no extra headers): 16.9 s to first
-#     byte, 0.28 MB/s sustained
-#   * full_browser_headers_with_referer:              0.56 s to first
-#     byte, 1.44 MB/s sustained — five times faster
-# So we mimic a browser navigation as closely as we can. Referer is
-# populated to a generic bandcamp.com URL since download_file gets
-# called without item context; full-page Referer would be marginally
-# better but requires patching upstream's sync_item too.
+# Mimic Firefox 133 — the user proved their Firefox downloads full
+# speed (120MB in 2s) from Bandcamp while our previous Chrome-shaped
+# requests got dynamically throttled.  curl_cffi's
+# impersonate="firefox133" sets the right TLS+HTTP/2 fingerprint;
+# headers below are the Firefox-on-macOS set (DNT, Sec-GPC, Priority
+# are Firefox-only; no Sec-Ch-Ua-* which are Chrome-only). User-Agent
+# is left to impersonate's default for consistency.
+_BROWSER_IMPERSONATE = "firefox133"
 _BROWSER_HEADERS = {
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
+        "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8"
     ),
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Language": "en-US,en;q=0.5",
     "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Sec-Ch-Ua": (
-        '"Chromium";v="124", "Google Chrome";v="124", "Not.A/Brand";v="99"'
-    ),
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"macOS"',
+    "DNT": "1",
+    "Sec-GPC": "1",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "same-site",
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
+    "Priority": "u=0, i",
     "Referer": "https://bandcamp.com/",
     "Connection": "keep-alive",
 }
@@ -149,7 +143,7 @@ def download_file(
 
     while True:
         with requests.Session(
-            impersonate="chrome",
+            impersonate=_BROWSER_IMPERSONATE,
             curl_options=_PATIENT_OPTIONS,
         ) as session:
             resume_attempt = bytes_total > 0
