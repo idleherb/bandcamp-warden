@@ -45,6 +45,38 @@ import httpx
 log = logging.getLogger("warden.downloader")
 
 
+# Empirically validated (see /test-browser-headers): Bandcamp's CDN
+# throttles non-browser-shaped requests to ~0.28 MB/s but serves
+# browser-shaped requests at 1.44+ MB/s. So every download request
+# from this module sends the same headers a real Chrome navigation
+# would emit. Referer is a generic bandcamp.com URL — per-album
+# Referer would be marginally better but requires more plumbing.
+_BROWSER_HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Sec-Ch-Ua": (
+        '"Chromium";v="124", "Google Chrome";v="124", "Not.A/Brand";v="99"'
+    ),
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-site",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://bandcamp.com/",
+    "Connection": "keep-alive",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
+
+
 # ---------- Path sanitization ----------
 
 # Same rule bandcampsync uses (LocalMedia._clean_path), so albums land
@@ -309,7 +341,7 @@ class WardenDownloader:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             with path.open("ab") as fh:
                 while True:
-                    headers: dict[str, str] = {}
+                    headers: dict[str, str] = dict(_BROWSER_HEADERS)
                     is_resume = bytes_written > 0
                     if is_resume:
                         headers["Range"] = f"bytes={bytes_written}-"

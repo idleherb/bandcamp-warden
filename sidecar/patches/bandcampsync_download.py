@@ -59,6 +59,40 @@ _PATIENT_OPTIONS = {
 }
 
 
+# Browser-faithful request shape. Empirical finding from
+# /test-browser-headers (commit bfcb7ff): Bandcamp's CDN throttles
+# requests that lack the headers a real browser navigation would send.
+# Variant comparison on the same signed URL:
+#   * minimal_chrome_impersonate (no extra headers): 16.9 s to first
+#     byte, 0.28 MB/s sustained
+#   * full_browser_headers_with_referer:              0.56 s to first
+#     byte, 1.44 MB/s sustained — five times faster
+# So we mimic a browser navigation as closely as we can. Referer is
+# populated to a generic bandcamp.com URL since download_file gets
+# called without item context; full-page Referer would be marginally
+# better but requires patching upstream's sync_item too.
+_BROWSER_HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Sec-Ch-Ua": (
+        '"Chromium";v="124", "Google Chrome";v="124", "Not.A/Brand";v="99"'
+    ),
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-site",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://bandcamp.com/",
+    "Connection": "keep-alive",
+}
+
+
 def mask_sig(url):
     if "&sig=" not in url:
         return url
@@ -80,9 +114,9 @@ class DownloadInvalidContentType(ValueError):
 
 
 def _open_stream(session, url, byte_offset):
-    """Open a streaming GET, optionally with Range: bytes=N-. Returns
-    the response. Caller is responsible for closing it."""
-    headers = {}
+    """Open a streaming GET with full browser headers, optionally with
+    Range: bytes=N- for resume. Caller is responsible for closing it."""
+    headers = dict(_BROWSER_HEADERS)
     if byte_offset > 0:
         headers["Range"] = f"bytes={byte_offset}-"
     return session.get(url, stream=True, headers=headers)
@@ -109,7 +143,7 @@ def download_file(
 
     log.info(
         "[warden patch] download_file: low_speed_time=%ds, "
-        "low_speed_limit=%dB/s, max_resumes=%d",
+        "low_speed_limit=%dB/s, max_resumes=%d, browser_headers=on",
         _LOW_SPEED_TIME, _LOW_SPEED_LIMIT, _MAX_RESUMES,
     )
 

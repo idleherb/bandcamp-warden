@@ -269,15 +269,20 @@ class State:
                 )
             else:
                 # Retry: bump attempt, keep baseline, clear terminal fields.
+                # COALESCE(baseline, ?) backfills baseline for rows
+                # created before the baseline column existed (older
+                # rows have it NULL); rows that already have a value
+                # keep it so quota is preserved across the whole day.
                 db.execute(
                     """UPDATE daily_runs
                        SET attempt = attempt + 1,
+                           baseline = COALESCE(baseline, ?),
                            status = 'running',
                            stop_reason = NULL,
                            finished_at = NULL,
                            last_exit_code = NULL
                        WHERE run_date = ?""",
-                    (run_date,),
+                    (baseline, run_date),
                 )
             row = db.execute(
                 "SELECT * FROM daily_runs WHERE run_date = ?", (run_date,)
