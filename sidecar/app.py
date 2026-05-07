@@ -33,7 +33,7 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import Field
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -1744,6 +1744,95 @@ async def sample_metadata(count: int = 5) -> dict:
         "files_total": sum(field_coverage.values()) // (len(field_coverage) or 1),
         "field_coverage": dict(sorted(field_coverage.items(), key=lambda kv: -kv[1])),
         "samples": samples,
+    }
+
+
+class _ProbeURLBody(BaseModel):
+    url: str
+    sample_bytes: int = 5_000_000
+
+
+@app.post("/probe-url")
+async def probe_url(body: _ProbeURLBody) -> dict:
+    """Hit a SPECIFIC URL the user pasted (e.g. the popplers5.bandcamp.com
+    URL their browser just used at 39 MB/s) and measure throughput from
+    the sidecar. Lets us isolate: is the slowdown about request shape
+    (then this URL crawls) or about URL freshness/auth (then this URL
+    flies)?
+
+    The user pastes the EXACT URL from their browser's address bar or
+    network tab. We send it with full Firefox-mimicry headers and the
+    cookies.txt cookie jar."""
+    if controller.is_running():
+        return {"error": "bandcampsync container running"}
+    return await asyncio.to_thread(_probe_url_sync, body.url, body.sample_bytes)
+
+
+def _probe_url_sync(url: str, sample_bytes: int) -> dict:
+    import time as _time
+    cookies_path = Path(settings.config_view_path) / "cookies.txt"
+    cookies = {}
+    if cookies_path.exists():
+        for line in cookies_path.read_text(errors="replace").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7 and "bandcamp.com" in parts[0]:
+                cookies[parts[5]] = parts[6]
+
+    headers = {
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "DNT": "1",
+        "Sec-GPC": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Priority": "u=0, i",
+        "Referer": "https://bandcamp.com/",
+        "Connection": "keep-alive",
+    }
+
+    start = _time.time()
+    bytes_dl = 0
+    first_chunk_after = None
+    error = None
+    http_status = None
+    try:
+        with curl_requests.Session(impersonate="firefox133") as s:
+            r = s.get(
+                url, headers=headers, cookies=cookies,
+                stream=True, timeout=120,
+            )
+            http_status = r.status_code
+            for chunk in r.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    if first_chunk_after is None:
+                        first_chunk_after = round(_time.time() - start, 2)
+                    bytes_dl += len(chunk)
+                    if bytes_dl >= sample_bytes:
+                        break
+                if _time.time() - start > 120:
+                    break
+            r.close()
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+
+    duration = max(0.001, _time.time() - start)
+    return {
+        "http_status": http_status,
+        "duration_seconds": round(duration, 2),
+        "first_chunk_after_seconds": first_chunk_after,
+        "bytes": bytes_dl,
+        "MB_per_s": round((bytes_dl / 1_000_000) / duration, 2),
+        "error": error,
+        "cookie_count": len(cookies),
     }
 
 
