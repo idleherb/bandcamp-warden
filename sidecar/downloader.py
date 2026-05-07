@@ -39,7 +39,8 @@ from tempfile import TemporaryDirectory
 from typing import AsyncIterator, Callable
 from zipfile import ZipFile
 
-import httpx
+import curl_cffi.requests as curl_requests
+from curl_cffi.const import CurlOpt
 
 
 log = logging.getLogger("warden.downloader")
@@ -322,82 +323,90 @@ class WardenDownloader:
     ) -> tuple[int, int, str]:
         """Stream `url` to `path` with Range-resume on stall.
 
-        Returns (bytes_written, resumes_used, content_type).
-        Raises on terminal failure.
+        Uses curl_cffi.Session(impersonate="chrome") because Bandcamp's
+        CDN appears to TLS-fingerprint clients in addition to checking
+        request headers; httpx with all the right headers still gets
+        throttled (validated empirically: same headers via httpx hung
+        for 10 minutes, via curl_cffi got 1.44 MB/s on the same URL).
+
+        Runs in a thread because curl_cffi's API is sync.
         """
+        return await asyncio.to_thread(
+            self._stream_to_file_sync, url, path, log_event,
+        )
+
+    def _stream_to_file_sync(
+        self, url: str, path: Path, log_event: Callable[[str], None],
+    ) -> tuple[int, int, str]:
         bytes_written = 0
         resumes = 0
         content_length_total: int | None = None
         content_type: str = ""
         last_log_pct = 0
 
-        timeout = httpx.Timeout(
-            connect=self.connect_timeout,
-            read=self.read_timeout,
-            write=self.read_timeout,
-            pool=self.connect_timeout,
-        )
+        with path.open("ab") as fh:
+            while True:
+                headers: dict[str, str] = dict(_BROWSER_HEADERS)
+                is_resume = bytes_written > 0
+                if is_resume:
+                    headers["Range"] = f"bytes={bytes_written}-"
 
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            with path.open("ab") as fh:
-                while True:
-                    headers: dict[str, str] = dict(_BROWSER_HEADERS)
-                    is_resume = bytes_written > 0
-                    if is_resume:
-                        headers["Range"] = f"bytes={bytes_written}-"
-
-                    try:
-                        async with client.stream("GET", url, headers=headers) as r:
-                            # Status sanity
+                try:
+                    with curl_requests.Session(
+                        impersonate="chrome",
+                        curl_options={
+                            CurlOpt.LOW_SPEED_TIME: 60,
+                            CurlOpt.LOW_SPEED_LIMIT: 1024,
+                        },
+                    ) as session:
+                        r = session.get(
+                            url, headers=headers, stream=True,
+                            timeout=self.connect_timeout + self.read_timeout,
+                        )
+                        try:
                             if is_resume and r.status_code == 200:
-                                # Server ignored our Range header. Wipe
-                                # the file and start over.
-                                log_event(
-                                    f"  ! server ignored Range, restarting from 0"
-                                )
+                                log_event("  ! server ignored Range, restarting from 0")
                                 fh.seek(0)
                                 fh.truncate()
                                 bytes_written = 0
                                 last_log_pct = 0
                             elif is_resume and r.status_code == 416:
-                                # Range Not Satisfiable — already fully
-                                # downloaded. Treat as success.
                                 if (
                                     content_length_total is not None
                                     and bytes_written >= content_length_total
                                 ):
                                     log_event("  · 416 with full content, OK")
                                     return bytes_written, resumes, content_type
-                                raise httpx.HTTPStatusError(
-                                    "416 with incomplete content",
-                                    request=r.request, response=r,
-                                )
+                                raise RuntimeError("416 with incomplete content")
                             elif r.status_code not in (200, 206):
-                                raise httpx.HTTPStatusError(
-                                    f"unexpected status {r.status_code}",
-                                    request=r.request, response=r,
+                                raise RuntimeError(
+                                    f"unexpected status {r.status_code}"
                                 )
 
-                            # Learn total expected size
                             if content_length_total is None:
-                                cr = r.headers.get("content-range")
+                                cr = (
+                                    r.headers.get("content-range")
+                                    or r.headers.get("Content-Range")
+                                )
                                 if cr:
-                                    # bytes 0-N/TOTAL
                                     m = re.match(r"bytes\s+\d+-\d+/(\d+)", cr)
                                     if m:
                                         content_length_total = int(m.group(1))
                                 else:
-                                    cl = r.headers.get("content-length")
+                                    cl = (
+                                        r.headers.get("content-length")
+                                        or r.headers.get("Content-Length")
+                                    )
                                     if cl:
                                         content_length_total = int(cl)
                             if not content_type:
                                 content_type = (
-                                    r.headers.get("content-type", "")
-                                    .split(";")[0]
-                                    .strip()
+                                    (r.headers.get("content-type")
+                                     or r.headers.get("Content-Type") or "")
+                                    .split(";")[0].strip()
                                 )
 
-                            async for chunk in r.aiter_bytes(chunk_size=64 * 1024):
+                            for chunk in r.iter_content(chunk_size=64 * 1024):
                                 if not chunk:
                                     continue
                                 fh.write(chunk)
@@ -409,43 +418,31 @@ class WardenDownloader:
                                     if pct >= last_log_pct + 10:
                                         last_log_pct = (pct // 10) * 10
                                         log_event(f"  … {last_log_pct}%")
+                        finally:
+                            r.close()
 
-                        # Stream finished without exception. Verify size.
                         if (
                             content_length_total
                             and bytes_written < content_length_total
                         ):
-                            # Premature EOF. Treat as resumable.
-                            raise httpx.RemoteProtocolError(
-                                "premature EOF before content-length"
-                            )
+                            raise RuntimeError("premature EOF before content-length")
                         return bytes_written, resumes, content_type
 
-                    except (
-                        httpx.HTTPStatusError,
-                        httpx.ReadTimeout,
-                        httpx.WriteTimeout,
-                        httpx.PoolTimeout,
-                        httpx.ConnectTimeout,
-                        httpx.RemoteProtocolError,
-                        httpx.ReadError,
-                        httpx.NetworkError,
-                        httpx.WriteError,
-                    ) as e:
-                        if resumes >= self.max_resumes_per_album:
-                            log_event(
-                                f"  ✗ giving up after {resumes} resumes "
-                                f"({type(e).__name__}: {e})"
-                            )
-                            raise
-                        resumes += 1
+                except Exception as e:
+                    if resumes >= self.max_resumes_per_album:
                         log_event(
-                            f"  ↺ {type(e).__name__} at offset "
-                            f"{bytes_written}/{content_length_total} — "
-                            f"resume {resumes}/{self.max_resumes_per_album}"
+                            f"  ✗ giving up after {resumes} resumes "
+                            f"({type(e).__name__}: {e})"
                         )
-                        await asyncio.sleep(self.resume_delay_seconds)
-                        continue
+                        raise
+                    resumes += 1
+                    log_event(
+                        f"  ↺ {type(e).__name__} at offset "
+                        f"{bytes_written}/{content_length_total} — "
+                        f"resume {resumes}/{self.max_resumes_per_album}"
+                    )
+                    time.sleep(self.resume_delay_seconds)
+                    continue
 
     # ----- ZIP handling -----
 
