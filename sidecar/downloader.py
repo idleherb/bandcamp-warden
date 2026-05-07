@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -358,6 +359,12 @@ class WardenDownloader:
         content_length_total: int | None = None
         content_type: str = ""
         last_log_pct = 0
+        # Python-side stall timeout. curl_cffi's CurlOpt.LOW_SPEED_TIME
+        # was empirically observed NOT to fire under impersonate=chrome,
+        # leaving us at the mercy of TCP keepalive (effectively forever).
+        # This is our backstop: a watchdog thread closes the response
+        # forcefully if no bytes arrive for N seconds.
+        STALL_SECONDS = max(int(self.read_timeout), 30)
 
         with path.open("ab") as fh:
             while True:
@@ -378,6 +385,35 @@ class WardenDownloader:
                             url, headers=headers, stream=True,
                             timeout=self.connect_timeout + self.read_timeout,
                         )
+
+                        # ---- watchdog ----
+                        watchdog_state = {
+                            "last_progress_at": time.time(),
+                            "bytes_seen": 0,
+                            "killed": False,
+                        }
+                        watchdog_stop = threading.Event()
+
+                        def _watchdog() -> None:
+                            while not watchdog_stop.is_set():
+                                if watchdog_stop.wait(timeout=5):
+                                    return
+                                idle = time.time() - watchdog_state["last_progress_at"]
+                                if idle > STALL_SECONDS:
+                                    watchdog_state["killed"] = True
+                                    log_event(
+                                        f"  ⚠ watchdog: no bytes for "
+                                        f"{int(idle)}s, closing connection"
+                                    )
+                                    try:
+                                        r.close()
+                                    except Exception:
+                                        pass
+                                    return
+
+                        wd_thread = threading.Thread(target=_watchdog, daemon=True)
+                        wd_thread.start()
+
                         try:
                             if is_resume and r.status_code == 200:
                                 log_event("  ! server ignored Range, restarting from 0")
@@ -426,6 +462,9 @@ class WardenDownloader:
                                     continue
                                 fh.write(chunk)
                                 bytes_written += len(chunk)
+                                # watchdog progress beat
+                                watchdog_state["last_progress_at"] = time.time()
+                                watchdog_state["bytes_seen"] = bytes_written
                                 if content_length_total:
                                     pct = int(
                                         bytes_written / content_length_total * 100
@@ -433,8 +472,16 @@ class WardenDownloader:
                                     if pct >= last_log_pct + 10:
                                         last_log_pct = (pct // 10) * 10
                                         log_event(f"  … {last_log_pct}%")
+                            # If the watchdog killed the response, surface
+                            # that as an exception so the resume path runs.
+                            if watchdog_state["killed"]:
+                                raise RuntimeError("watchdog stall close")
                         finally:
-                            r.close()
+                            watchdog_stop.set()
+                            try:
+                                r.close()
+                            except Exception:
+                                pass
 
                         if (
                             content_length_total
