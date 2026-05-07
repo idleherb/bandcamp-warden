@@ -32,7 +32,7 @@ import docker.errors
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -131,6 +131,9 @@ class _NoHealthzFilter(logging.Filter):
 
 
 logging.getLogger("uvicorn.access").addFilter(_NoHealthzFilter())
+# uvicorn.access doesn't propagate to root by default — explicitly attach
+# our ring buffer at startup once it's defined further down. (See
+# _RingLogHandler attachment below; we'll add it to uvicorn.access too.)
 
 
 class _RingLogHandler(logging.Handler):
@@ -153,8 +156,11 @@ _sidecar_log_buffer.setFormatter(
     logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 )
 _sidecar_log_buffer.setLevel(logging.INFO)
-# Attach to the root logger so we capture warden, uvicorn, apscheduler etc.
+# Attach to root + uvicorn.access (which doesn't propagate to root by
+# default, so we'd otherwise miss every HTTP request log line).
 logging.getLogger().addHandler(_sidecar_log_buffer)
+logging.getLogger("uvicorn.access").addHandler(_sidecar_log_buffer)
+logging.getLogger("uvicorn.error").addHandler(_sidecar_log_buffer)
 
 
 # ---------- Patterns ----------
@@ -1479,14 +1485,18 @@ async def trigger_now() -> dict:
 
 
 @app.post("/stop")
-async def stop_now() -> dict:
+async def stop_now(request: Request) -> dict:
     """Force-stop bandcampsync. Suppresses any auto-retry that would
     otherwise fire (since SIGTERM gives a non-zero exit code)."""
+    client = getattr(request.client, "host", "unknown")
+    log.warning(
+        "POST /stop from %s — bandcampsync will be terminated", client
+    )
     orchestrator._user_stop_requested = True
     if orchestrator._retry_task and not orchestrator._retry_task.done():
         orchestrator._retry_task.cancel()
     controller.stop()
-    return {"stopped": True}
+    return {"stopped": True, "caller_ip": client}
 
 
 @app.post("/check-cookie")
