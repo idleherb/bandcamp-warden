@@ -1558,6 +1558,90 @@ async def sample_metadata(count: int = 5) -> dict:
     }
 
 
+@app.post("/test-range-support")
+async def test_range_support(item_id: int | None = None) -> dict:
+    """Probe whether Bandcamp's signed download URL accepts HTTP Range
+    requests. If it returns 206 Partial Content with the right
+    Content-Range header, our resume strategy works. If it returns 200
+    (ignoring the Range header), Range-resume is dead in the water and
+    we need a different concept (full sidecar-side downloader)."""
+    if controller.is_running():
+        return {"error": "bandcampsync running, would compete for bandwidth"}
+    return await asyncio.to_thread(_test_range_sync, item_id)
+
+
+def _test_range_sync(item_id: int | None) -> dict:
+    from bandcampsync.bandcamp import Bandcamp  # type: ignore
+
+    cookies_path = Path(settings.config_view_path) / "cookies.txt"
+    if not cookies_path.exists():
+        return {"error": "cookies.txt missing"}
+    try:
+        bc = Bandcamp(cookies_path.read_text(errors="replace"))
+        bc.verify_authentication()
+        bc.load_purchases()
+    except Exception as e:
+        return {"error": f"bandcampsync init: {type(e).__name__}: {e}"}
+
+    target = None
+    if item_id is not None:
+        target = next((p for p in bc.purchases if p.item_id == item_id), None)
+    elif bc.purchases:
+        target = bc.purchases[0]
+    if target is None:
+        return {"error": "no purchase to test"}
+
+    try:
+        url = bc.get_download_file_url(target, encoding="flac")
+    except Exception as e:
+        return {"error": f"URL resolution: {type(e).__name__}: {e}"}
+
+    out: dict = {"item_id": target.item_id, "band_name": target.band_name}
+
+    # Step 1: HEAD-like — small initial GET to learn content-length and
+    # whether server advertises range support.
+    try:
+        with curl_requests.Session(impersonate="chrome") as s:
+            r = s.get(url, headers={"Range": "bytes=0-1023"}, timeout=30)
+            out["initial_status"] = r.status_code
+            cr = r.headers.get("Content-Range") or r.headers.get("content-range")
+            out["initial_content_range"] = cr
+            out["initial_accept_ranges"] = (
+                r.headers.get("Accept-Ranges") or r.headers.get("accept-ranges")
+            )
+            out["initial_content_length"] = r.headers.get("Content-Length")
+            out["initial_bytes_first_16"] = (r.content or b"")[:16].hex()
+            r.close()
+    except Exception as e:
+        out["initial_error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    # Step 2: ranged GET from somewhere mid-file. If the server gives us
+    # 206 + correct Content-Range, Range works. If 200, ignored.
+    try:
+        with curl_requests.Session(impersonate="chrome") as s:
+            r = s.get(
+                url, headers={"Range": "bytes=1048576-1049599"}, timeout=30,
+            )
+            out["range_status"] = r.status_code
+            out["range_content_range"] = (
+                r.headers.get("Content-Range") or r.headers.get("content-range")
+            )
+            out["range_content_length"] = r.headers.get("Content-Length")
+            r.close()
+    except Exception as e:
+        out["range_error"] = f"{type(e).__name__}: {e}"
+
+    # Verdict
+    if out.get("range_status") == 206:
+        out["verdict"] = "RANGE_SUPPORTED"
+    elif out.get("range_status") == 200:
+        out["verdict"] = "RANGE_IGNORED"
+    else:
+        out["verdict"] = "INCONCLUSIVE"
+    return out
+
+
 @app.post("/test-download")
 async def test_download(
     max_seconds: int = 1800,
