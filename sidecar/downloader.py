@@ -135,6 +135,7 @@ class WardenDownloader:
         self,
         downloads_root: Path,
         config_dir: Path,
+        state_dir: Path | None = None,
         format_name: str = "flac",
         connect_timeout: float = 30.0,
         read_timeout: float = 60.0,
@@ -144,6 +145,12 @@ class WardenDownloader:
     ) -> None:
         self.downloads_root = downloads_root
         self.config_dir = config_dir
+        # state_dir is the sidecar's RW state mount. We use it as the
+        # primary location for ignores tracking because /config might
+        # be read-only (legacy compose). When config_dir IS writable,
+        # we also append to /config/ignores.txt to keep the file in
+        # sync for any future container-strategy fallback.
+        self.state_dir = state_dir
         self.format_name = format_name
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
@@ -482,27 +489,47 @@ class WardenDownloader:
         return "bin"
 
     # ----- ignores.txt -----
+    #
+    # Reading: union of both paths (sidecar's /state and bandcampsync's
+    # /config) so neither tool re-downloads what the other did.
+    # Writing: prefer /config (legacy bandcampsync location) when it's
+    # writable; fall back to /state. This way Plan C works even when
+    # the user's compose still mounts /config:ro.
+
+    def _ignore_paths(self) -> list[Path]:
+        paths = [self.config_dir / "ignores.txt"]
+        if self.state_dir is not None:
+            paths.append(self.state_dir / "ignores_warden.txt")
+        return paths
 
     def _read_ignores(self) -> set[int]:
-        path = self.config_dir / "ignores.txt"
         out: set[int] = set()
-        if not path.exists():
-            return out
-        for line in path.read_text(errors="replace").splitlines():
-            stripped = line.split("#", 1)[0].strip()
-            if stripped.isdigit():
-                out.add(int(stripped))
+        for path in self._ignore_paths():
+            if not path.exists():
+                continue
+            for line in path.read_text(errors="replace").splitlines():
+                stripped = line.split("#", 1)[0].strip()
+                if stripped.isdigit():
+                    out.add(int(stripped))
         return out
 
     def _append_ignore(self, item_id: int, band: str, title: str) -> None:
-        path = self.config_dir / "ignores.txt"
-        # Match bandcampsync's existing format: id  # band / title
         line = f"{item_id}  # {band} / {title}\n"
-        try:
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line)
-        except Exception as e:
-            log.warning("failed to append ignores.txt: %s", e)
+        # Try /config first (bandcampsync convention). If RO, fall
+        # back to /state. Worst case: log warning, still no crash.
+        for path in self._ignore_paths():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line)
+                return
+            except Exception as e:
+                log.warning("append %s failed: %s", path, e)
+                continue
+        log.error(
+            "could not append ignore entry for item %d to any path",
+            item_id,
+        )
 
     # ----- helpers -----
 

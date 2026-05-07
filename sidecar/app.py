@@ -1095,38 +1095,16 @@ class Orchestrator:
         """
         from downloader import WardenDownloader  # local module
 
-        # /config must be writable so WardenDownloader can append to
-        # ignores.txt. Otherwise we'd download the same albums every
-        # day. Detect early, fail loudly.
-        config_dir = Path(self.settings.config_view_path)
-        probe = config_dir / ".warden_write_probe"
-        try:
-            probe.write_text("ok")
-            probe.unlink()
-        except Exception as e:
-            err = (
-                f"/config not writable: {type(e).__name__}: {e}. "
-                f"Update compose: change `{config_dir}:ro` to `{config_dir}` "
-                f"(remove `:ro`)."
-            )
-            log.error(err)
-            self.state.update_run(
-                run_date, status="failed_to_start", stop_reason=err,
-                finished_at=datetime.now(timezone.utc).isoformat(),
-            )
-            await self.telegram.send(
-                "❌ *Start fehlgeschlagen*\n"
-                "Sidecar-Strategy braucht /config als rw-Mount. "
-                "TrueNAS-YAML: das `:ro` am /config-Volume entfernen, "
-                "Save → Container Restart."
-            )
-            return
-
+        # WardenDownloader writes ignores entries to /state (always RW)
+        # if /config is mounted RO; reads union of both. So no compose
+        # change required.
         downloads_root = Path(self.settings.downloads_view_path)
         config_dir = Path(self.settings.config_view_path)
+        state_dir = Path(self.settings.state_path)
         dl = WardenDownloader(
             downloads_root=downloads_root,
             config_dir=config_dir,
+            state_dir=state_dir,
             format_name="flac",
         )
 
@@ -2076,6 +2054,7 @@ async def test_sidecar_download(
     dl = WardenDownloader(
         downloads_root=Path(settings.downloads_view_path),
         config_dir=Path(settings.config_view_path),
+        state_dir=Path(settings.state_path),
         format_name="flac",
     )
 
