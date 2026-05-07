@@ -133,6 +133,31 @@ curl -X POST 'http://homeserver:31080/backfill-metadata'
 curl -X POST 'http://homeserver:31080/backfill-metadata?force=true'
 ```
 
+## Plan C: sidecar-side downloader (httpx + Range resume)
+
+When the bandcampsync container's download mechanism keeps failing (curl-error-28 stalls, mystery SIGKILLs), the sidecar can take over the actual file download itself. It still uses `bandcampsync` as a library to authenticate, list purchases, and resolve signed download URLs — but the streaming, ZIP extraction, and ignores.txt append happen inside the sidecar, with httpx async + proper read-timeout + HTTP Range resume.
+
+**Test before adopting**: `POST /test-sidecar-download` runs the new downloader for one (or N) album(s) without touching the daily-run mechanism. Returns success/failure + bytes + resume count + log events. If it works for a few albums, we flip the daily run over.
+
+**YAML requirement**: `/config` mount must be RW for the sidecar (it appends item ids to `ignores.txt` directly). Change `:/config:ro` → `:/config` in the deployed compose.
+
+### Endpoints
+
+```sh
+# One album, picks first not-yet-downloaded
+curl -X POST 'http://homeserver:31080/test-sidecar-download'
+
+# Specific item by id
+curl -X POST 'http://homeserver:31080/test-sidecar-download?item_id=1234567'
+
+# A few in a row to validate stability
+curl -X POST 'http://homeserver:31080/test-sidecar-download?count=3'
+```
+
+### Tunables (env on the sidecar)
+
+`WardenDownloader` has its own knobs but defaults are sensible: `connect_timeout=30s`, `read_timeout=60s`, `max_resumes_per_album=30`, `resume_delay=10s`, `between_albums=5s`. Override only if a daily run keeps stalling.
+
 ## Bandcampsync download patch
 
 bandcampsync 0.7.0's downloader uses curl_cffi with `impersonate="chrome"`, which sets `LOW_SPEED_TIME=30` / `LOW_SPEED_LIMIT=1` — abort the stream after 30 seconds of less than 1 byte/sec. Bandcamp's edge sometimes pauses bursts mid-album, especially on big FLAC archives, and that triggers a curl-error-28 crash.
