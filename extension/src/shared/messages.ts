@@ -5,8 +5,7 @@ export type Message =
 
 export interface FetchFanIdResult {
     fanId: number;
-    initialToken: string;
-    itemCount: number | null;
+    isFanVerified: boolean;
 }
 
 export interface RefreshQueueResult {

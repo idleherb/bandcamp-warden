@@ -47,7 +47,7 @@ async function handleMessage(message: Message): Promise<MessageResponse> {
                 await log.info('fetch-fan-id requested');
                 const ctx = await fetchHomepageContext();
                 await log.info(
-                    `fan_id=${ctx.fanId}, item_count=${ctx.itemCount ?? '?'}`,
+                    `fan_id=${ctx.fanId}, verified=${ctx.isFanVerified}`,
                 );
                 const data: FetchFanIdResult = ctx;
                 return { ok: true, data };
@@ -56,11 +56,11 @@ async function handleMessage(message: Message): Promise<MessageResponse> {
                 await log.info('refresh-queue requested');
                 const ctx = await fetchHomepageContext();
                 let pages = 0;
-                const items = await paginateCollection(ctx.fanId, ctx.initialToken, {
+                const items = await paginateCollection(ctx.fanId, {
                     onProgress: (p) => {
                         pages = p.page;
                         void log.info(
-                            `refresh page ${p.page}: total=${p.fetched}, more=${p.moreAvailable}`,
+                            `refresh page ${p.page}: +${p.pageItemCount} (total ${p.fetched})`,
                         );
                     },
                 });

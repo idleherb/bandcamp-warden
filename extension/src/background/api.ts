@@ -4,6 +4,7 @@ const HOMEPAGE_URL = 'https://bandcamp.com/';
 const COLLECTION_API = 'https://bandcamp.com/api/fancollection/1/collection_items';
 const PAGE_SIZE = 100;
 const INTER_PAGE_DELAY_MS = 500;
+const MAX_PAGES = 200;
 
 export class BandcampParseError extends Error {
     constructor(msg: string) {
@@ -13,29 +14,34 @@ export class BandcampParseError extends Error {
 }
 
 interface HomepageBlob {
-    identities?: { fan?: { id?: number | string } };
-    fan_data?: { fan_id?: number | string };
-    pageContext?: { identity?: { fanId?: number | string } };
-    collection_data?: { last_token?: string; item_count?: number };
+    pageContext?: {
+        identity?: {
+            fanId?: number | string;
+            isFanVerified?: boolean;
+        };
+    };
+    [k: string]: unknown;
 }
 
 interface CollectionItemRaw {
     item_id?: number;
     sale_item_id?: number;
+    sale_item_type?: string;
     band_name?: string;
     item_title?: string;
-    download_url?: string;
-    item_url?: string;
+    token?: string;
+    item_type?: string;
 }
 
 interface CollectionResponse {
     items?: CollectionItemRaw[];
+    redownload_urls?: Record<string, string>;
     more_available?: boolean;
-    last_token?: string;
 }
 
 interface DownloadPageBlob {
     digital_items?: Array<{
+        item_id?: number;
         downloads?: Record<string, { url?: string }>;
     }>;
 }
@@ -43,7 +49,14 @@ interface DownloadPageBlob {
 function parseBlob<T>(html: string, divId: string): T {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const div = doc.getElementById(divId);
-    if (!div) throw new BandcampParseError(`<div id="${divId}"> not found`);
+    if (!div) {
+        const allDivs = Array.from(doc.querySelectorAll('div[id][data-blob]'))
+            .map((d) => d.id)
+            .join(', ');
+        throw new BandcampParseError(
+            `<div id="${divId}"> not found (divs with data-blob: ${allDivs || 'none'})`,
+        );
+    }
     const blob = div.getAttribute('data-blob');
     if (!blob) throw new BandcampParseError(`<div id="${divId}"> has no data-blob`);
     try {
@@ -53,55 +66,44 @@ function parseBlob<T>(html: string, divId: string): T {
     }
 }
 
-async function fetchHomepageBlob(): Promise<HomepageBlob> {
-    const res = await fetch(HOMEPAGE_URL, { credentials: 'include' });
-    if (!res.ok) throw new Error(`homepage fetch failed: HTTP ${res.status}`);
-    const html = await res.text();
-    return parseBlob<HomepageBlob>(html, 'pagedata');
-}
-
 function asPositiveNumber(v: unknown): number | null {
     const n = typeof v === 'string' ? Number(v) : v;
     return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : null;
 }
 
-interface HomepageContext {
+export interface HomepageContext {
     fanId: number;
-    initialToken: string;
-    itemCount: number | null;
+    isFanVerified: boolean;
 }
 
 export async function fetchHomepageContext(): Promise<HomepageContext> {
-    const blob = await fetchHomepageBlob();
-    const fanIdCandidates = [
-        blob.identities?.fan?.id,
-        blob.fan_data?.fan_id,
-        blob.pageContext?.identity?.fanId,
-    ];
-    let fanId: number | null = null;
-    for (const c of fanIdCandidates) {
-        const n = asPositiveNumber(c);
-        if (n !== null) {
-            fanId = n;
-            break;
-        }
+    const res = await fetch(HOMEPAGE_URL, { credentials: 'include' });
+    if (!res.ok) throw new Error(`homepage fetch failed: HTTP ${res.status}`);
+    const html = await res.text();
+    const blob = parseBlob<HomepageBlob>(html, 'HomepageApp');
+    const identity = blob.pageContext?.identity;
+    if (!identity || typeof identity !== 'object') {
+        throw new BandcampParseError(
+            `pageContext.identity missing — are you logged in? top-level keys: ${Object.keys(blob).join(', ')}`,
+        );
     }
+    const fanId = asPositiveNumber(identity.fanId);
     if (fanId === null) {
-        throw new BandcampParseError('fan_id not found in homepage data-blob (are you logged in?)');
+        throw new BandcampParseError(
+            `fanId missing in pageContext.identity. Identity keys: ${Object.keys(identity).join(', ')}`,
+        );
     }
-    const last = blob.collection_data?.last_token;
-    const initialToken =
-        typeof last === 'string' && last.length > 0
-            ? last
-            : `${Math.floor(Date.now() / 1000)}::a::`;
-    const itemCount = asPositiveNumber(blob.collection_data?.item_count);
-    return { fanId, initialToken, itemCount };
+    return { fanId, isFanVerified: identity.isFanVerified === true };
+}
+
+function initialPaginationToken(): string {
+    return `${Math.floor(Date.now() / 1000)}:0:a::`;
 }
 
 export interface PaginateProgress {
     page: number;
     fetched: number;
-    moreAvailable: boolean;
+    pageItemCount: number;
 }
 
 export interface PaginateOptions {
@@ -111,13 +113,13 @@ export interface PaginateOptions {
 
 export async function paginateCollection(
     fanId: number,
-    initialToken: string,
     options: PaginateOptions = {},
 ): Promise<QueueItem[]> {
-    const { onProgress, maxPages = 100 } = options;
+    const { onProgress, maxPages = MAX_PAGES } = options;
     const items: QueueItem[] = [];
     const seen = new Set<number>();
-    let token = initialToken;
+    let token = initialPaginationToken();
+
     for (let page = 1; page <= maxPages; page++) {
         const res = await fetch(COLLECTION_API, {
             method: 'POST',
@@ -125,17 +127,33 @@ export async function paginateCollection(
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 fan_id: fanId,
-                older_than_token: token,
                 count: PAGE_SIZE,
+                older_than_token: token,
             }),
         });
         if (!res.ok) throw new Error(`collection_items POST failed: HTTP ${res.status}`);
         const json = (await res.json()) as CollectionResponse;
         const raw = json.items ?? [];
+        if (raw.length === 0) {
+            onProgress?.({ page, fetched: items.length, pageItemCount: 0 });
+            break;
+        }
+        const redownloadUrls = json.redownload_urls;
+        if (!redownloadUrls || typeof redownloadUrls !== 'object') {
+            throw new BandcampParseError('collection_items response missing redownload_urls');
+        }
+
+        let pageAdded = 0;
+        let lastToken: string | null = null;
         for (const r of raw) {
+            if (typeof r.token === 'string' && r.token.length > 0) lastToken = r.token;
             const id = asPositiveNumber(r.item_id);
             if (id === null || seen.has(id)) continue;
-            const url = r.download_url;
+            const saleType = r.sale_item_type;
+            const saleId = r.sale_item_id;
+            if (!saleType || saleId == null) continue;
+            const key = `${saleType}${saleId}`;
+            const url = redownloadUrls[key];
             if (typeof url !== 'string' || url.length === 0) continue;
             seen.add(id);
             items.push({
@@ -144,18 +162,17 @@ export async function paginateCollection(
                 itemTitle: r.item_title ?? '',
                 downloadPageUrl: url,
             });
+            pageAdded++;
         }
-        const more = json.more_available === true;
-        onProgress?.({ page, fetched: items.length, moreAvailable: more });
-        const next = json.last_token;
-        if (!more || typeof next !== 'string' || next.length === 0 || next === token) {
-            break;
-        }
-        token = next;
+        onProgress?.({ page, fetched: items.length, pageItemCount: pageAdded });
+
+        if (lastToken === null || lastToken === token) break;
+        token = lastToken;
         if (page < maxPages) {
             await new Promise((resolve) => setTimeout(resolve, INTER_PAGE_DELAY_MS));
         }
     }
+
     return items;
 }
 
