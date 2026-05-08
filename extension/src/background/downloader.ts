@@ -3,7 +3,6 @@ import type { DownloadFormat, QueueItem } from '../shared/types.js';
 import { resolveSignedDownloadUrl } from './api.js';
 
 const DOWNLOAD_TIMEOUT_MS = 60 * 60 * 1000;
-const META_DOWNLOAD_TIMEOUT_MS = 60 * 1000;
 
 const FORMAT_EXT: Record<DownloadFormat, string> = {
     flac: 'flac',
@@ -40,81 +39,12 @@ function payloadFilenameFor(
     }
     const ext = kind === 'track' ? FORMAT_EXT[format] : 'zip';
     const base = `bandcamp_${itemId}.${ext}`;
-    return joinSub(subfolder, base);
-}
-
-function metaFilenameFor(itemId: number, subfolder: string): string {
-    return joinSub(subfolder, `bandcamp_${itemId}.meta.json`);
-}
-
-function joinSub(subfolder: string, base: string): string {
     const cleanSub = sanitizeSubfolder(subfolder);
     return cleanSub ? `${cleanSub}/${base}` : base;
 }
 
-interface MetaJson {
-    item_id: number;
-    band_name: string;
-    item_title: string;
-    item_url: string | null;
-    tralbum_type: string | null;
-    art_id: number | null;
-    featured_track: string | null;
-    purchased_at: string | null;
-    added_at: string | null;
-    downloaded_format: DownloadFormat;
-    downloaded_at: string;
-    extension_version: string;
-}
-
-function buildMetaJson(item: QueueItem, format: DownloadFormat): MetaJson {
-    return {
-        item_id: item.id,
-        band_name: item.bandName,
-        item_title: item.itemTitle,
-        item_url: item.itemUrl ?? null,
-        tralbum_type: item.tralbumType ?? null,
-        art_id: typeof item.artId === 'number' ? item.artId : null,
-        featured_track: item.featuredTrack ?? null,
-        purchased_at: item.purchasedAt ?? null,
-        added_at: item.addedAt ?? null,
-        downloaded_format: format,
-        downloaded_at: new Date().toISOString(),
-        extension_version: browser.runtime.getManifest().version,
-    };
-}
-
-async function writeMetaJson(
-    item: QueueItem,
-    format: DownloadFormat,
-    subfolder: string,
-): Promise<{ filename: string; downloadId: number }> {
-    const meta = buildMetaJson(item, format);
-    const json = JSON.stringify(meta, null, 2);
-    // data: URL avoids Object-URL lifecycle quirks (in some Firefox builds the
-    // URL gets revoked before downloads.download finishes consuming it, which
-    // surfaces as the unhelpful "An unexpected error occurred"). For a few-KB
-    // metadata blob the encoding overhead is negligible.
-    const dataUrl = `data:application/json;charset=utf-8,${encodeURIComponent(json)}`;
-    const filename = metaFilenameFor(item.id, subfolder);
-    try {
-        const downloadId = await browser.downloads.download({
-            url: dataUrl,
-            filename,
-            conflictAction: 'uniquify',
-            saveAs: false,
-        });
-        await waitForDownload(downloadId, META_DOWNLOAD_TIMEOUT_MS);
-        return { filename, downloadId };
-    } catch (err) {
-        const reason = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-        throw new Error(`meta.json write failed (${filename}): ${reason}`);
-    }
-}
-
 export interface DownloadOutcome {
     filename: string;
-    metaFilename: string;
     signedUrl: string;
     downloadId: number;
 }
@@ -126,12 +56,6 @@ export async function downloadItem(
 ): Promise<DownloadOutcome> {
     const signedUrl = await resolveSignedDownloadUrl(item.downloadPageUrl, format);
     const filename = payloadFilenameFor(item.id, signedUrl, format, subfolder);
-
-    // Meta JSON first (small, fast) so the sidecar inbox watcher always sees
-    // it next to the ZIP once the much-longer ZIP download lands.
-    const meta = await writeMetaJson(item, format, subfolder);
-    void log.info(`meta written: ${meta.filename}`);
-
     void log.info(
         `download starting: ${filename} (item ${item.id}: ${item.bandName} — ${item.itemTitle})`,
     );
@@ -143,7 +67,7 @@ export async function downloadItem(
     });
     await waitForDownload(downloadId, DOWNLOAD_TIMEOUT_MS);
     void log.info(`download done: ${filename} (downloadId=${downloadId})`);
-    return { filename, metaFilename: meta.filename, signedUrl, downloadId };
+    return { filename, signedUrl, downloadId };
 }
 
 function waitForDownload(downloadId: number, timeoutMs: number): Promise<void> {
