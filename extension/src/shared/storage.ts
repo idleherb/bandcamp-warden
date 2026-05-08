@@ -53,6 +53,7 @@ export const DEFAULT_STATE: State = {
     todayResetAt: new Date().toISOString().slice(0, 10),
     consecutiveFailures: 0,
     pausedUntil: null,
+    transientPausedUntil: null,
 };
 
 export const stateStore = makeStore<State>('state', DEFAULT_STATE);

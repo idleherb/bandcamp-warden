@@ -15,15 +15,18 @@ import {
     paginateCollection,
     resolveSignedDownloadUrl,
 } from './api.js';
-import { downloadItem } from './downloader.js';
+import { downloadItem, TransientDownloadError } from './downloader.js';
 import { dailyResetIfNeeded, shouldRunNow } from './pacing.js';
 import {
     markCompleted,
     markFailed,
     popNextItem,
     recoverOrphanedInFlight,
+    requeueItemHead,
     resetRunState,
 } from './queue.js';
+
+const TRANSIENT_PAUSE_SEC = 120;
 
 const VERSION = browser.runtime.getManifest().version;
 const ALARM_NAME = 'warden-tick';
@@ -79,6 +82,13 @@ async function processOneTick(force = false): Promise<TickResult> {
         await markCompleted(item.id);
         return { run: true, itemId: item.id };
     } catch (err) {
+        if (err instanceof TransientDownloadError) {
+            await requeueItemHead(item, TRANSIENT_PAUSE_SEC);
+            void log.warn(
+                `transient ${err.code} on item ${item.id}; requeued, pausing ${TRANSIENT_PAUSE_SEC}s (no failure counter increment)`,
+            );
+            return { run: false, reason: `transient (${err.code}), requeued` };
+        }
         await markFailed(item.id, describeError(err));
         return { run: false, reason: `failed: ${describeError(err)}` };
     }

@@ -4,6 +4,19 @@ import { resolveSignedDownloadUrl } from './api.js';
 
 const DOWNLOAD_TIMEOUT_MS = 60 * 60 * 1000;
 
+export class TransientDownloadError extends Error {
+    constructor(public code: string) {
+        super(`transient download failure: ${code}`);
+        this.name = 'TransientDownloadError';
+    }
+}
+
+// Errors that point to local filesystem / mount instability rather than the
+// remote (Bandcamp) side. We retry these without burning the consecutive-
+// failure budget that the real circuit breaker watches. FILE_NO_SPACE is
+// intentionally NOT in here — it's a hard stop, not a transient blip.
+const TRANSIENT_ERROR_CODES = new Set(['FILE_FAILED', 'FILE_TRANSIENT_ERROR']);
+
 const FORMAT_EXT: Record<DownloadFormat, string> = {
     flac: 'flac',
     'mp3-v0': 'mp3',
@@ -89,8 +102,12 @@ function waitForDownload(downloadId: number, timeoutMs: number): Promise<void> {
             if (state === 'complete') {
                 settle(() => resolve());
             } else if (state === 'interrupted') {
-                const reason = delta.error?.current ?? 'unknown';
-                settle(() => reject(new Error(`download interrupted: ${reason}`)));
+                const code = delta.error?.current ?? 'unknown';
+                if (TRANSIENT_ERROR_CODES.has(code)) {
+                    settle(() => reject(new TransientDownloadError(code)));
+                } else {
+                    settle(() => reject(new Error(`download interrupted: ${code}`)));
+                }
             }
         };
         browser.downloads.onChanged.addListener(onChanged);

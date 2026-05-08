@@ -37,6 +37,12 @@ export function shouldRunNow(
             return { run: false, reason: `paused-until=${state.pausedUntil}` };
         }
     }
+    if (state.transientPausedUntil) {
+        const until = new Date(state.transientPausedUntil);
+        if (until > now) {
+            return { run: false, reason: `transient-paused-until=${state.transientPausedUntil}` };
+        }
+    }
     if (state.todayDownloaded >= config.dailyQuota) {
         return { run: false, reason: `quota-met (${state.todayDownloaded}/${config.dailyQuota})` };
     }

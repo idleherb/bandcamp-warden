@@ -79,6 +79,16 @@ export async function markFailed(itemId: number, error: string): Promise<void> {
     void log.error(`item ${itemId} failed (attempt ${attempts}): ${error}`);
 }
 
+export async function requeueItemHead(item: QueueItem, transientPauseSec: number): Promise<void> {
+    await queueStore.update((q) => [item, ...q.filter((x) => x.id !== item.id)]);
+    const until = new Date(Date.now() + transientPauseSec * 1000).toISOString();
+    await stateStore.update((s) => ({
+        ...s,
+        inFlight: null,
+        transientPausedUntil: until,
+    }));
+}
+
 export async function recoverOrphanedInFlight(): Promise<void> {
     const s = await stateStore.get();
     if (s.inFlight === null) return;
@@ -98,6 +108,7 @@ export async function resetRunState(): Promise<void> {
         todayDownloaded: 0,
         consecutiveFailures: 0,
         pausedUntil: null,
+        transientPausedUntil: null,
     }));
     await completedStore.set([]);
     await failedStore.set([]);

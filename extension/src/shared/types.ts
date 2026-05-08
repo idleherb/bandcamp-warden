@@ -50,6 +50,7 @@ export interface State {
     todayResetAt: string;
     consecutiveFailures: number;
     pausedUntil: string | null;
+    transientPausedUntil: string | null;
 }
 
 export type LogLevel = 'info' | 'warn' | 'error';
