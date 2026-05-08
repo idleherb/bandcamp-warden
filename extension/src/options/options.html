@@ -21,6 +21,24 @@
         </section>
 
         <section>
+            <h2>Queue <span id="queue-count" class="muted"></span></h2>
+            <p id="queue-preview" class="muted small"></p>
+        </section>
+
+        <section>
+            <h2>Bandcamp API tests</h2>
+            <p class="muted small">
+                Buttons hit bandcamp.com using your browser cookies. Make sure you're logged in.
+            </p>
+            <div class="buttons">
+                <button id="btn-fan-id" type="button">Fetch fan_id</button>
+                <button id="btn-refresh-queue" type="button">Refresh queue (full pagination)</button>
+                <button id="btn-resolve-first" type="button">Resolve signed URL (first queue item)</button>
+            </div>
+            <pre id="api-result" class="result"></pre>
+        </section>
+
+        <section>
             <h2>Recent log <button id="refresh-log" type="button">Refresh</button> <button id="emit-test-log" type="button">Emit test entry</button></h2>
             <ol id="log" reversed></ol>
         </section>
