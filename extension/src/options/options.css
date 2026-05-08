@@ -14,4 +14,83 @@ main {
 h1 {
     color: #629aa9;
     margin-top: 0;
+    margin-bottom: 0.25rem;
+}
+
+h2 {
+    color: #629aa9;
+    margin-top: 2rem;
+    margin-bottom: 0.5rem;
+    font-size: 1.1rem;
+    font-weight: 600;
+}
+
+#version {
+    color: #888;
+    margin-top: 0;
+    font-size: 0.9rem;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+}
+
+td {
+    padding: 0.25rem 0.5rem;
+    border-bottom: 1px solid #2a2a2a;
+}
+
+td.k {
+    color: #888;
+    width: 14rem;
+}
+
+td.v {
+    color: #e0e0e0;
+}
+
+button {
+    background: #2a2a2a;
+    color: #e0e0e0;
+    border: 1px solid #444;
+    padding: 0.2rem 0.6rem;
+    margin-left: 0.5rem;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.8rem;
+}
+
+button:hover {
+    background: #333;
+    border-color: #629aa9;
+}
+
+ol#log {
+    list-style: decimal inside;
+    padding: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.78rem;
+    max-height: 300px;
+    overflow-y: auto;
+    background: #0f0f0f;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    padding: 0.5rem;
+}
+
+ol#log li {
+    padding: 0.15rem 0;
+    color: #aaa;
+    list-style: none;
+}
+
+ol#log li.lvl-warn {
+    color: #d8b65c;
+}
+
+ol#log li.lvl-error {
+    color: #d86a5c;
 }
