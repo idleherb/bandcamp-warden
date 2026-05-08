@@ -29,6 +29,7 @@ export interface Config {
     maxDelaySec: number;
     circuitBreakerThreshold: number;
     circuitBreakerPauseSec: number;
+    inboxSubfolder: string;
 }
 
 export interface State {

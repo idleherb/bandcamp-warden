@@ -9,7 +9,7 @@ import type {
     ResolveFirstUrlResult,
     SetEnabledResult,
 } from '../shared/messages.js';
-import { queueStore, stateStore } from '../shared/storage.js';
+import { completedStore, queueStore, stateStore } from '../shared/storage.js';
 import {
     fetchHomepageContext,
     paginateCollection,
@@ -75,7 +75,7 @@ async function processOneTick(force = false): Promise<TickResult> {
     }
     void log.info(`tick: processing ${item.bandName} — ${item.itemTitle} (id=${item.id})`);
     try {
-        await downloadItem(item, config.format);
+        await downloadItem(item, config.format, config.inboxSubfolder);
         await markCompleted(item.id);
         return { run: true, itemId: item.id };
     } catch (err) {
@@ -119,12 +119,17 @@ async function handleMessage(message: Message): Promise<MessageResponse> {
                         );
                     },
                 });
-                await queueStore.set(items);
-                await log.info(`refresh-queue done: ${items.length} items, ${pages} pages`);
+                const completed = new Set(await completedStore.get());
+                const filtered = items.filter((i) => !completed.has(i.id));
+                const skipped = items.length - filtered.length;
+                await queueStore.set(filtered);
+                await log.info(
+                    `refresh-queue done: ${items.length} fetched, ${skipped} skipped (already completed), ${filtered.length} queued, ${pages} pages`,
+                );
                 const data: RefreshQueueResult = {
                     fetched: items.length,
                     pages,
-                    queueSize: items.length,
+                    queueSize: filtered.length,
                 };
                 return { ok: true, data };
             }

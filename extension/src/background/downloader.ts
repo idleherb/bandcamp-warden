@@ -15,7 +15,20 @@ const FORMAT_EXT: Record<DownloadFormat, string> = {
     'aiff-lossless': 'aiff',
 };
 
-function filenameFor(itemId: number, signedUrl: string, format: DownloadFormat): string {
+function sanitizeSubfolder(raw: string): string {
+    // Strip leading/trailing slashes and any "../" segments — Firefox would
+    // reject the download anyway, but we want a clean log message.
+    const trimmed = raw.replace(/^\/+|\/+$/g, '');
+    const parts = trimmed.split('/').filter((p) => p.length > 0 && p !== '..' && p !== '.');
+    return parts.join('/');
+}
+
+function filenameFor(
+    itemId: number,
+    signedUrl: string,
+    format: DownloadFormat,
+    subfolder: string,
+): string {
     let kind: 'album' | 'track' | 'unknown' = 'unknown';
     try {
         const path = new URL(signedUrl).pathname;
@@ -24,10 +37,10 @@ function filenameFor(itemId: number, signedUrl: string, format: DownloadFormat):
     } catch {
         // Malformed URL — fall through to unknown; .zip is a safe-ish default.
     }
-    if (kind === 'track') {
-        return `bandcamp_${itemId}.${FORMAT_EXT[format]}`;
-    }
-    return `bandcamp_${itemId}.zip`;
+    const ext = kind === 'track' ? FORMAT_EXT[format] : 'zip';
+    const base = `bandcamp_${itemId}.${ext}`;
+    const cleanSub = sanitizeSubfolder(subfolder);
+    return cleanSub ? `${cleanSub}/${base}` : base;
 }
 
 export interface DownloadOutcome {
@@ -39,9 +52,10 @@ export interface DownloadOutcome {
 export async function downloadItem(
     item: QueueItem,
     format: DownloadFormat,
+    subfolder: string,
 ): Promise<DownloadOutcome> {
     const signedUrl = await resolveSignedDownloadUrl(item.downloadPageUrl, format);
-    const filename = filenameFor(item.id, signedUrl, format);
+    const filename = filenameFor(item.id, signedUrl, format, subfolder);
     void log.info(
         `download starting: ${filename} (item ${item.id}: ${item.bandName} — ${item.itemTitle})`,
     );
