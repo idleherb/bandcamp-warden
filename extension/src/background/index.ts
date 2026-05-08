@@ -1,5 +1,7 @@
 const VERSION = browser.runtime.getManifest().version;
 
+void browser.browserAction.setBadgeBackgroundColor({ color: '#629aa9' });
+
 browser.runtime.onInstalled.addListener((details) => {
     console.log(`[warden] installed/updated: ${details.reason}, version ${VERSION}`);
 });
