@@ -1,0 +1,22 @@
+{
+    "name": "bandcamp-warden-extension",
+    "version": "0.1.0",
+    "description": "Firefox extension that downloads the user's Bandcamp collection at a humane pace using their real browser identity.",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "build": "vite build",
+        "dev": "vite build --watch",
+        "typecheck": "tsc --noEmit",
+        "run:firefox": "web-ext run --source-dir=dist --target=firefox-desktop",
+        "sign": "web-ext sign --source-dir=dist --channel=unlisted --use-submission-api --api-key=$AMO_JWT_ISSUER --api-secret=$AMO_JWT_SECRET",
+        "package": "web-ext build --source-dir=dist --artifacts-dir=web-ext-artifacts --overwrite-dest"
+    },
+    "devDependencies": {
+        "@types/firefox-webext-browser": "^120.0.4",
+        "typescript": "^5.6.0",
+        "vite": "^5.4.0",
+        "vite-plugin-web-extension": "^4.4.4",
+        "web-ext": "^8.3.0"
+    }
+}
