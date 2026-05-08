@@ -8,9 +8,6 @@ void browser.browserAction.setBadgeBackgroundColor({ color: '#629aa9' });
 
 browser.runtime.onInstalled.addListener(async (details) => {
     await log.info(`installed/updated: ${details.reason}, version ${VERSION}`);
-    // Touch stores so defaults materialize and become inspectable in DevTools.
-    await configStore.get();
-    await stateStore.get();
 });
 
 browser.runtime.onStartup.addListener(async () => {
@@ -21,4 +18,10 @@ browser.browserAction.onClicked.addListener(() => {
     void browser.runtime.openOptionsPage();
 });
 
-void log.info(`background script loaded, version ${VERSION}`);
+// Materialize defaults on every BG-script load. update(x => x) is idempotent:
+// it reads (returning defaults if absent or merged-stored if present) and
+// writes the same value back, so user-edited config survives reloads.
+void Promise.all([
+    configStore.update((c) => c),
+    stateStore.update((s) => s),
+]).then(() => log.info(`background script loaded, version ${VERSION}`));
