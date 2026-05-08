@@ -284,16 +284,206 @@ Drei Optionen für Install in deinen Firefox:
 
 Über 2-3 Sessions verteilt machbar. MVP nach 6-8h, Rest ist Polish.
 
-## Offene Architekturfragen (vom User zu beantworten)
+## Entscheidungen (vom User bestätigt 2026-05-08)
 
-1. **Variante 1 (TrueNAS organisiert) oder Variante 2 (flacher Inbox)** für die ZIPs?
-   → Empfehle V1, ist mehr Code aber sauber Audio-Library-ready.
-2. **Distribution**: Developer Edition / about:debugging / AMO-Signing?
-   → Empfehle C (AMO-Signing).
-3. **SMB-Mount-Pfad** auf dem Mac: `/Volumes/storage/media/bandcamp` korrekt?
-4. **caffeinate**: manuell ODER LaunchAgent-Auto?
-5. **Quota** bestätigen: 500/Tag oder anders?
-6. **Active hours**: durchgehend oder z.B. 22:00–08:00 nur Schlaf?
+1. **ZIP-Handling**: **Variante 1** — TrueNAS-Sidecar erkennt ZIPs in Inbox, entpackt nach `Artist/Album/`, schreibt `bandcamp_<id>.json`, löscht ZIP.
+2. **Distribution**: **AMO Self-Distribution Signing** (unlisted). Wir benutzen `web-ext sign --use-submission-api`. Resultat: signierte `.xpi` die in Standard-Firefox per Drag-and-Drop installierbar ist und permanent läuft. Kein Public-Listing auf addons.mozilla.org. Erster Submit braucht 1-7 Tage Review, Folgereleases meist <24h.
+3. **SMB-Mount-Pfad** auf Mac: `/Volumes/storage/media/bandcamp` ist korrekt.
+4. **caffeinate**: **LaunchAgent-Auto** — wird zusammen mit der Extension installiert.
+5. **Quota**: **250 Alben/Tag**.
+6. **Active Hours**: **24/7** (kein Zeitfenster).
+
+Daraus abgeleitete Pacing-Defaults:
+- Bei 250/24h = 1 Album alle ~5.7 Min im Schnitt
+- Random Jitter zwischen Downloads: **uniform [60s, 300s]** (statt der ursprünglich vorgeschlagenen 30-180s, weil 250/Tag mehr Zeit-Reserve gibt und breiter gestreutes Pacing harmloser aussieht)
+- In Options-Page weiterhin tweakbar
+
+## Implementation-Reihenfolge (Roadmap)
+
+Folge-Claude soll in dieser Reihenfolge arbeiten und nach jedem Punkt einen sinnvollen Commit machen:
+
+### Phase 1: Extension-Skeleton + Build
+1. `extension/` Verzeichnis-Layout wie oben spezifiziert anlegen
+2. `manifest.json` MV2 mit Permissions: `storage`, `alarms`, `downloads`, `tabs`, Hosts `https://bandcamp.com/*` und `https://*.bandcamp.com/*`. `browser_specific_settings.gecko.id` setzen — irgendwas eindeutiges wie `warden-helper@idleherb.bandcamp-warden`.
+3. `package.json` mit Dependencies: `webextension-polyfill`, `typescript`, `vite`, `@types/firefox-webext-browser`, `vite-plugin-web-extension` (oder einfacher: rohes esbuild-build-script). `web-ext` als devDep für sign + run.
+4. `tsconfig.json` strict, target ES2022, module ESNext
+5. `vite.config.ts` der Background- und Options-Bundles produziert in `extension/dist/`
+6. Icons: 16/32/128 PNG. Können simple Platzhalter sein. (User soll später ggf. selber gestalten — niedrige Priorität.)
+7. Build-Test: `pnpm build` produziert eine ladbare `extension/dist/` Verzeichnisstruktur.
+
+### Phase 2: Core-Datenstrukturen + Storage
+8. `src/shared/types.ts`: `QueueItem`, `State`, `Config` Interfaces wie unter "Queue-Persistence" beschrieben.
+9. `src/shared/storage.ts`: typsichere wrapper um `browser.storage.local.get/set` mit atomic update-helper (read-modify-write in einem `await`).
+10. `src/shared/log.ts`: Ringbuffer-Logger der in `browser.storage.local["log"]` schreibt (capped auf z.B. 500 Zeilen). Wird in Options-Page angezeigt.
+11. `src/shared/config.ts`: Config-Defaults (quota 250, jitter 60-300s, etc.) + Reader/Writer.
+
+### Phase 3: Bandcamp-API-Integration
+12. `src/background/api.ts`:
+    - `getFanIdFromHomepage()` — fetched `https://bandcamp.com/`, parst `<div id="HomepageApp" data-blob>` JSON, extrahiert `pageContext.identity.fanId`.
+    - `paginateCollection(fanId)` — POST an `https://bandcamp.com/api/fancollection/1/collection_items` mit `{fan_id, count: 100, older_than_token}`. Iteriert bis `more_available=false`. Returnt Array `{id, bandName, itemTitle, downloadPageUrl}`.
+    - `resolveSignedUrl(downloadPageUrl, format)` — fetched die `bandcamp.com/download?...` Page, parst `<div id="pagedata" data-blob>`, navigiert nach `digital_items[0].downloads[<format>].url`.
+    - Alle fetch-Calls mit `credentials: 'include'` damit User-Cookies des Browsers verwendet werden.
+    - Defensive Parser: wenn JSON-Schema ändert, expliziter Throw mit Hinweis "Bandcamp HTML changed, parser needs update".
+
+### Phase 4: Queue + Scheduler
+13. `src/background/queue.ts`:
+    - `refreshQueue()` — pullt komplette Collection via api.ts, dedupes gegen `state.completed`, schreibt rest in `state.queue`.
+    - `popNextItem()` — atomically removes head, sets as `state.inFlight`. Returns null wenn queue leer.
+    - `markCompleted(itemId)` — moves item from inFlight to completed list, increments todayDownloaded, persists.
+    - `markFailed(itemId, error)` — increments consecutiveFailures, pushes to failed list.
+14. `src/background/pacing.ts`:
+    - `shouldRunNow(state, config)` — prüft: Quota für heute erreicht? Circuit-Break aktiv? Genug Zeit seit letztem Download?
+    - `dailyResetIfNeeded(state)` — setzt `todayDownloaded=0` wenn neuer Tag.
+    - `circuitBreakerLogic` — nach N consecutiveFailures: 1h Pause, dann Probe-Item, dann längere Pause wenn der auch failt. Reset auf 0 nach erstem Success.
+15. `src/background/index.ts`:
+    - On install/startup: `browser.alarms.create('warden-tick', { periodInMinutes: 1 })`
+    - On alarm: `processOneTick()` — wenn `inFlight` schon gesetzt, no-op. Wenn nicht: `shouldRunNow` checken, Item ziehen, Download starten.
+    - Browser-Action-Click handler: opens Options-Page tab.
+
+### Phase 5: Download-Orchestrator
+16. `src/background/downloader.ts`:
+    - `downloadItem(item)`:
+      - Resolve signed URL via api.ts
+      - `browser.downloads.download({ url, filename: 'bandcamp_${id}.zip', conflictAction: 'uniquify' })`
+      - Dateinamen-Schema: **`bandcamp_<itemId>.zip`** — flach, mit Item-ID damit Sidecar-Watcher die zuordnen kann.
+      - Promise das resolved wenn `browser.downloads.onChanged` mit state=complete für die Download-ID ankommt
+      - Reject wenn state=interrupted oder timeout (z.B. 1h pro Album)
+    - Auf Success: `markCompleted(item.id)`. Auf Fail: `markFailed(item.id, error)`.
+
+### Phase 6: Options-Page
+17. `src/options/options.html` + `options.ts`:
+    - Form-Felder: Daily Quota, Format Dropdown (default flac), Min/Max Delay, Download-Path-Anzeige (read-only — Firefox setzt's via `browser.downloads.setShelfEnabled` und download-folder-Pref, das müssen wir beim Install setten)
+    - Buttons: "Refresh Queue Now" (re-pulls collection from Bandcamp), "Pause/Resume", "Reset Failed Items"
+    - Status-Tabelle: total in queue / completed today / completed total / current state / current item (if any) / last 50 log lines
+    - Vue/React/Svelte unnötig — plain TS + DOM-Manipulation ist ausreichend für die paar Felder.
+
+### Phase 7: Browser-Action-Badge
+18. In `index.ts`: nach jedem successful download `browser.browserAction.setBadgeText({text: String(state.todayDownloaded)})` setzen. Bei `paused` oder `circuit-break`: `text: '⏸'` oder ähnlich. Bei Quota erreicht: ✓.
+
+### Phase 8: Server-Side Inbox-Watcher
+19. In `sidecar/app.py`:
+    - Neue settings: `inbox_path` (default `Path(downloads_view_path) / "_inbox"`), `inbox_poll_seconds` (default 30).
+    - `_inbox_watcher_loop()` async coroutine in lifespan registrieren.
+    - Pro ZIP in Inbox:
+      - Filename pattern matchen: `bandcamp_(\d+)\.zip`
+      - Item-ID extrahieren
+      - Per Fan-API (über bestehende `MetadataEnricher._fetch_collection_sync`) den Eintrag holen → `band_name`, `item_title`, `item_url`
+      - ZIP entpacken nach `<downloads>/<clean(band_name)>/<clean(item_title)>/`
+      - Audio-File-Verifikation: ≥1 audio file? wenn nicht, ZIP nach `_inbox/quarantine/` verschieben mit Telegram-Alert
+      - Bei Erfolg: `bandcamp_<id>.json` schreiben (gleiche Felder wie MetadataEnricher), Eintrag in `ignores_warden.txt` (oder `ignores.txt` wenn rw), ZIP löschen.
+    - Telegram-Push pro 10 verarbeitete Items mit Stats.
+20. Endpoint `GET /inbox-status` für Debugging: zeigt Anzahl Files in Inbox, last processed, Quarantäne-Inhalt.
+21. Test: lege manuell eine ZIP `bandcamp_4154699124.zip` in `/mnt/storage/media/bandcamp/_inbox/`, prüfe dass Sidecar sie aufgreift, entpackt, ZIP weg ist, Album-Ordner steht.
+
+### Phase 9: caffeinate LaunchAgent
+22. `extension/macos/com.warden.caffeinate.plist` — LaunchAgent das `caffeinate -i` ausführt solange `~/.warden/active` existiert (Extension legt File an beim ersten Tick wenn Quota nicht voll, löscht es nach Quota-Hit).
+    - `KeepAlive: { PathState: { /Users/<user>/.warden/active: true } }`
+    - `ProgramArguments: [/usr/bin/caffeinate, -i]`
+23. `install-launch-agent.sh` Script das die plist nach `~/Library/LaunchAgents/` kopiert mit ersetztem Username, dann `launchctl load`.
+24. Extension schreibt `~/.warden/active` via Native Messaging Helper... Hmm, WebExtensions können nicht direkt File-System-Access. Alternative: Extension setzt eine HTTP-Request an localhost-Port den ein kleines Helfer-Skript hört. Oder einfacher: LaunchAgent läuft IMMER (egal ob aktiv) wenn User eingeloggt ist — das ist auch akzeptabel, der `caffeinate -i` Overhead ist null. **EINFACHE LÖSUNG: LaunchAgent startet `caffeinate -i` permanent bei Login, kein Active-File-Check.** User kann's via `launchctl unload ~/Library/LaunchAgents/com.warden.caffeinate.plist` deaktivieren wenn gewünscht.
+
+### Phase 10: Distribution + Install-Doku
+25. `web-ext sign --api-key=... --api-secret=... --channel=unlisted` Workflow ans Repo's `package.json` als `npm run sign` script anhängen.
+26. `extension/INSTALL.md` mit Schritten:
+    - Voraussetzungen: Mac, Firefox >= 115, SMB-Mount auf TrueNAS
+    - Bandcamp im Firefox eingeloggt sein
+    - Download der signierten `.xpi` von Repo-Releases
+    - Drag-and-drop in `about:addons`
+    - Options-Page öffnen, Quota verifizieren, "Refresh Queue" klicken
+    - Firefox-Pref `browser.download.dir` auf `/Volumes/storage/media/bandcamp/_inbox` setzen (oder Extension setzt's automatisch via `browser.downloads.setShelfEnabled` + folder-pref-Tweak — TBD ob WebExtension das darf)
+    - LaunchAgent installieren via `bash install-launch-agent.sh`
+27. CI/CD: GHA-Workflow der bei Tag-Push die Extension baut, signed XPI als Release-Artefakt anhängt.
+
+### Phase 11: Testing + Polish
+28. End-to-End-Test: Extension in Firefox laden, eine kleine Test-Quota (z.B. 3 Alben) setzen, beobachten dass:
+    - Queue wird mit ~3110 Items gefüllt
+    - Erstes Album wird in `_inbox` gedumpt
+    - TrueNAS-Sidecar entpackt, organisiert
+    - Counter im Browser-Badge hochgeht
+    - Nach 3 Alben: Quota-Hit, Pause bis Mitternacht
+29. Resilienz-Tests:
+    - Browser killen mid-download → nach Restart resumed Queue (ZIP geht verloren, item zurück in Queue)
+    - Network-Aussetzer → onChanged interrupted → markFailed → next tick versucht's nochmal mit Pause
+    - Bandcamp Anti-Bot triggert → consecutive failures → circuit breaker → Telegram (via Sidecar / Server-Side Push)
+
+## Key Implementierungs-Details die der Folge-Claude wissen muss
+
+### Wie WebExtensions auf Bandcamp's Cookies kommen
+Sobald die Extension Hostpermission `*.bandcamp.com/*` hat, sendet `fetch(..., {credentials: 'include'})` automatisch die Browser-Cookies des Users. Wir müssen NICHTS manuell mit cookies.txt machen. Das ist anders als Server-Side wo wir cookies.txt parsen mussten.
+
+### Wie der Download-Folder gesetzt wird
+Firefox-Pref `browser.download.dir` ist NICHT direkt von WebExtensions setzbar. Optionen:
+1. User setzt es einmalig manuell in Firefox-Settings auf `/Volumes/storage/media/bandcamp/_inbox`
+2. Wir nutzen `browser.downloads.download({filename: '_inbox/bandcamp_${id}.zip'})` — der relative Pfad wird unter dem konfigurierten Default-Download-Folder erzeugt. Wenn der nicht stimmt, geht's halt nach `~/Downloads/_inbox/`. Funktioniert, ist aber off.
+3. Empfohlen: Install-Doku weist User an einmal manuell den Default zu setzen. Dann ist `filename: 'bandcamp_${id}.zip'` (flach) okay.
+
+### Bandcamp-Format-Strings
+Aus dem `data-blob`: `digital_items[0].downloads` ist ein Object mit Keys wie `flac`, `mp3-v0`, `mp3-320`, `aac-hi`, `vorbis`, `alac`, `wav`, `aiff-lossless`. User-Default `flac`.
+
+### Was bandcampsync v0.7.0 macht (Referenz)
+Quelle der API-Patterns: https://github.com/meeb/bandcampsync (kein License, daher nur Logik-Inspiration, kein Code-Copy). Konkret: `bandcampsync/bandcamp.py:280` (`load_purchases`) und `bandcampsync/bandcamp.py:282` (`get_download_file_url`) sind die Referenzen für API-Endpoint und data-blob-Pfad.
+
+### Existierender Sidecar-Code zum Wiederverwenden
+- `MetadataEnricher` in `sidecar/app.py:~410` hat bereits Fan-API-Integration via bandcampsync-Library + Folder-Matching mit NFKD-Normalisierung. Der Inbox-Watcher kann grosse Teile davon wiederverwenden — speziell `clean_path_component`, `_build_record`, `_atomic_write`.
+- `WardenDownloader` in `sidecar/downloader.py` ist im Plan-E-Setup obsolet, kann aber als Fallback bestehen bleiben (über `WARDEN_DOWNLOADER_STRATEGY=container` aktivierbar).
+- `_kickoff_sidecar` im Orchestrator wird nicht mehr getriggert sobald die Extension läuft. Daily-Kickoff kann optional auf "noop" umgestellt werden — die Extension scheduled sich selbst.
+
+### Sidecar-Konfiguration die geändert werden muss
+- Default `WARDEN_DOWNLOADER_STRATEGY` bleibt `sidecar`, aber Inbox-Watcher läuft parallel und übernimmt die echte Arbeit.
+- ODER: neue Strategy `WARDEN_DOWNLOADER_STRATEGY=inbox` die nur den Watcher startet und Daily-Kickoff komplett deaktiviert. Empfehlung: diese neue Strategy als Default setzen sobald Extension stabil läuft.
+
+### Telegram-Notifications die der Sidecar weiter pusht
+- ZIP angekommen + entpackt: optional, eher nicht (zu viel Spam bei 250/Tag)
+- Quota-Erreicht (250 today): Telegram-Push 1× pro Tag
+- Quarantäne-Item: Push mit Filename
+- Inbox-Watcher-Down: Healthcheck-failure-Alert
+- Cookie-Expiry: bestehende Logik, läuft weiter
+
+### Was die Extension NICHT braucht
+- Keine Telegram-Integration direkt. Status fließt über die Datei-Drops in den Sidecar, der pusht. Das hält Tokens lokal aufgeräumt.
+- Keine eigene Cookie-Verwaltung. Browser-Cookies sind die Single Source of Truth.
+- Keine Range-Resume-Logik. `browser.downloads` macht keine Range-Resumes; bei Abbruch wird das ganze ZIP neu geholt. Bei 250 Alben/Tag ist das 0.4% Wastage selbst wenn täglich 1 Item abbricht — vernachlässigbar.
+
+## Beziehung zu bisherigen Plan-A bis Plan-D Code
+
+| Komponente | Status nach Plan-E Implementierung |
+|---|---|
+| `sidecar/downloader.py` (Plan C) | bleibt, wird nicht mehr default-aktiv |
+| `sidecar/patches/bandcampsync_download.py` | bleibt, deaktiviert über `bandcampsync_patch_enabled=false` |
+| `sidecar/browser_downloader.py` (Plan D Playwright) | kann gelöscht werden ODER als Fallback behalten |
+| `sidecar/app.py` Plan-D Endpoints (`/test-browser-download`, `/test-range-support`, `/test-browser-headers`, `/probe-url`) | als Diagnose-Endpoints behalten — nützlich falls man's je wieder braucht |
+| `BandcampsyncController` (legacy container) | kann gelöscht werden |
+| Dockerfile Playwright-Setup | rückgängig machen wenn Plan-D aufgegeben wird (Image schrumpft auf ~250MB), oder behalten als Optionalität |
+| `_cleanup_orphan_bandcampsync` | kann weg sobald Container-Strategy entfernt |
+
+Empfehlung: **alles Legacy behalten als Fallback**, aber default auf Inbox-Strategy umstellen. Dockerfile darf Playwright zurückbauen weil's ungenutzt 1GB kostet — das ist ein eigener Refactor-Commit.
+
+## Was der Folge-Claude zuerst lesen soll
+
+Reihenfolge der Files zur Orientierung:
+
+1. `CLAUDE.md` (Projekt-Lighthouse)
+2. `docs/ARCHITECTURE.md` (Server-Side-Architektur die wir behalten)
+3. `docs/PLAN-mac-extension.md` (DIESES FILE)
+4. `docs/OPERATIONS.md` (Existierende Telegram-Patterns + Endpoints)
+5. `sidecar/app.py` (Settings-Class, MetadataEnricher, Telegram, State)
+6. Memory-Files unter `~/.claude/projects/.../memory/`
+
+## Status nach 5 Tagen Server-Side-Versuche (Datapoints für Folge-Claude)
+
+- 295 Albums fertig (von ~3110)
+- 14 Empty-Folder von Plan-A Bug bereits manuell gelöscht; ihre IDs sind in `ignores.txt` — werden vom Sidecar nicht nochmal angefasst, müssten via `/cleanup-stale-ignores?dry_run=false` aus ignores entfernt werden DAMIT die Extension sie als "noch zu downloaden" sieht.
+- **Wichtig**: User will 250/Tag. Bei aktuellen 295 done = noch 2815 = ~12 Tage Realmaß.
+- Server-Side mit jeder denkbaren HTTP-Mimicry: ~7 KB/s (=throttled). Nicht reparierbar, deshalb dieser Plan.
+- User's regulärer Firefox auf demselben Mac: 39 MB/s (bewiesen, mehrfach). Daher die Extension-Strategie.
+- Mac-SMB-Mount: `/Volumes/storage/media/bandcamp` (bestätigt). TrueNAS-Pfad: `/mnt/storage/media/bandcamp`.
+
+## Dont's
+
+- **Niemals** während der Implementation Test-Triggers gegen Bandcamp's Server-Side fahren. Der Account ist bereits auf einer Drosselungs-Liste, jeder weitere bot-artige Request verschlimmert das. Tests nur in der Extension via Firefox. Zur Not Test-Quota auf 1-3 stellen, schauen ob's klappt.
+- **Niemals** Code von Batchcamp wörtlich kopieren — keine Lizenz, IP-rechtlich riskant. Logik/Patterns schon, weil Tatsachen über Bandcamp's API.
+- **Niemals** AMO-Submission als "produktiv" markieren — wir wollen unlisted/self-distribution, sonst wird's gegen Bandcamps ToS geprüft (Bandcamp erlaubt private Backups, aber AMO-Reviewer könnten skeptisch sein).
+
 
 ## Risiken
 
