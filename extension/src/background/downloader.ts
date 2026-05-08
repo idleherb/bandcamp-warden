@@ -90,22 +90,25 @@ async function writeMetaJson(
     subfolder: string,
 ): Promise<{ filename: string; downloadId: number }> {
     const meta = buildMetaJson(item, format);
-    const blob = new Blob([JSON.stringify(meta, null, 2)], {
-        type: 'application/json',
-    });
-    const url = URL.createObjectURL(blob);
+    const json = JSON.stringify(meta, null, 2);
+    // data: URL avoids Object-URL lifecycle quirks (in some Firefox builds the
+    // URL gets revoked before downloads.download finishes consuming it, which
+    // surfaces as the unhelpful "An unexpected error occurred"). For a few-KB
+    // metadata blob the encoding overhead is negligible.
+    const dataUrl = `data:application/json;charset=utf-8,${encodeURIComponent(json)}`;
     const filename = metaFilenameFor(item.id, subfolder);
     try {
         const downloadId = await browser.downloads.download({
-            url,
+            url: dataUrl,
             filename,
-            conflictAction: 'overwrite',
+            conflictAction: 'uniquify',
             saveAs: false,
         });
         await waitForDownload(downloadId, META_DOWNLOAD_TIMEOUT_MS);
         return { filename, downloadId };
-    } finally {
-        URL.revokeObjectURL(url);
+    } catch (err) {
+        const reason = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+        throw new Error(`meta.json write failed (${filename}): ${reason}`);
     }
 }
 
