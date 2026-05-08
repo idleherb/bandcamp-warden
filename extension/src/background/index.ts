@@ -15,6 +15,7 @@ import {
     paginateCollection,
     resolveSignedDownloadUrl,
 } from './api.js';
+import { downloadItem } from './downloader.js';
 import { dailyResetIfNeeded, shouldRunNow } from './pacing.js';
 import {
     markCompleted,
@@ -57,13 +58,6 @@ interface TickResult {
     itemId?: number;
 }
 
-// Stub "download": Phase 5 swaps this for a real browser.downloads.download()
-// + onChanged listener. For now it just logs the URL it WOULD fetch and
-// completes instantly — gives Phase 4 a working state machine to test.
-async function stubDownload(itemId: number, downloadPageUrl: string): Promise<void> {
-    void log.info(`[STUB] would download item ${itemId} via ${downloadPageUrl.slice(0, 80)}…`);
-}
-
 async function processOneTick(force = false): Promise<TickResult> {
     await stateStore.update((s) => dailyResetIfNeeded(s));
     const [state, config] = await Promise.all([stateStore.get(), configStore.get()]);
@@ -81,7 +75,7 @@ async function processOneTick(force = false): Promise<TickResult> {
     }
     void log.info(`tick: processing ${item.bandName} — ${item.itemTitle} (id=${item.id})`);
     try {
-        await stubDownload(item.id, item.downloadPageUrl);
+        await downloadItem(item, config.format);
         await markCompleted(item.id);
         return { run: true, itemId: item.id };
     } catch (err) {
