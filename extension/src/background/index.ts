@@ -1,4 +1,4 @@
-import { configStore } from '../shared/config.js';
+import { configStore, DEFAULT_CONFIG } from '../shared/config.js';
 import { log } from '../shared/log.js';
 import type {
     FetchFanIdResult,
@@ -173,6 +173,11 @@ async function handleMessage(message: Message): Promise<MessageResponse> {
             }
             case 'reset-run-state': {
                 await resetRunState();
+                return { ok: true, data: { reset: true } };
+            }
+            case 'reset-config': {
+                await configStore.set({ ...DEFAULT_CONFIG });
+                await log.info('config reset to defaults');
                 return { ok: true, data: { reset: true } };
             }
         }

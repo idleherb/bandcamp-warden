@@ -4,7 +4,8 @@ export type Message =
     | { type: 'resolve-first-url' }
     | { type: 'process-tick'; force?: boolean }
     | { type: 'set-enabled'; value: boolean }
-    | { type: 'reset-run-state' };
+    | { type: 'reset-run-state' }
+    | { type: 'reset-config' };
 
 export interface FetchFanIdResult {
     fanId: number;

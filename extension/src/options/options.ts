@@ -191,3 +191,11 @@ document.getElementById('btn-reset-state')?.addEventListener('click', () =>
         'scheduler-result',
     ),
 );
+
+document.getElementById('btn-reset-config')?.addEventListener('click', () =>
+    void runMessage<{ reset: boolean }>(
+        { type: 'reset-config' },
+        'reset-config',
+        'scheduler-result',
+    ),
+);

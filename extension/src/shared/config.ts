@@ -8,10 +8,11 @@ export const DEFAULT_CONFIG: Config = {
     maxDelaySec: 300,
     circuitBreakerThreshold: 5,
     circuitBreakerPauseSec: 3600,
-    // Subfolder under Firefox's default download dir. For production use
-    // empty string + point Firefox at /Volumes/.../bandcamp/_inbox; for
-    // local dev use "warden-inbox" so test ZIPs don't litter ~/Downloads.
-    inboxSubfolder: 'warden-inbox',
+    // Subfolder under Firefox's default download dir. Plan-canonical name
+    // matching the sidecar inbox watcher's expected path. Point Firefox
+    // at the parent (e.g. /Volumes/.../bandcamp/) and ZIPs land in
+    // /Volumes/.../bandcamp/_inbox/bandcamp_<id>.zip.
+    inboxSubfolder: '_inbox',
 };
 
 export const configStore = makeStore<Config>('config', DEFAULT_CONFIG);
