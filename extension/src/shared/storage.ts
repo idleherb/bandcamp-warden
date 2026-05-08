@@ -45,8 +45,10 @@ export function makeStore<T>(key: string, defaults: T): Store<T> {
 }
 
 export const DEFAULT_STATE: State = {
+    enabled: false,
     inFlight: null,
     lastRunAt: null,
+    nextRunAt: null,
     todayDownloaded: 0,
     todayResetAt: new Date().toISOString().slice(0, 10),
     consecutiveFailures: 0,

@@ -39,6 +39,21 @@
         </section>
 
         <section>
+            <h2>Scheduler</h2>
+            <p class="muted small">
+                Phase 4 stub — "downloads" do not actually fetch ZIPs yet, but the
+                queue/state machine is real. Items popped here move to <code>completed</code>.
+            </p>
+            <div class="buttons">
+                <button id="btn-tick" type="button">Process one tick</button>
+                <button id="btn-tick-force" type="button">Process one tick (force)</button>
+                <button id="btn-toggle-enabled" type="button">Toggle enabled</button>
+                <button id="btn-reset-state" type="button">Reset run state</button>
+            </div>
+            <pre id="scheduler-result" class="result"></pre>
+        </section>
+
+        <section>
             <h2>Recent log <button id="refresh-log" type="button">Refresh</button> <button id="emit-test-log" type="button">Emit test entry</button></h2>
             <ol id="log" reversed></ol>
         </section>

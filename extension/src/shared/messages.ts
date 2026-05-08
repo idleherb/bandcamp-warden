@@ -1,7 +1,10 @@
 export type Message =
     | { type: 'fetch-fan-id' }
     | { type: 'refresh-queue' }
-    | { type: 'resolve-first-url' };
+    | { type: 'resolve-first-url' }
+    | { type: 'process-tick'; force?: boolean }
+    | { type: 'set-enabled'; value: boolean }
+    | { type: 'reset-run-state' };
 
 export interface FetchFanIdResult {
     fanId: number;
@@ -19,6 +22,14 @@ export interface ResolveFirstUrlResult {
     bandName: string;
     itemTitle: string;
     signedUrlPreview: string;
+}
+
+export interface ProcessTickResult {
+    decision: { run: true; itemId: number } | { run: false; reason: string };
+}
+
+export interface SetEnabledResult {
+    enabled: boolean;
 }
 
 export type MessageResponse<T = unknown> =

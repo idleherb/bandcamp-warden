@@ -3,11 +3,18 @@ import { log, logStore } from '../shared/log.js';
 import type {
     FetchFanIdResult,
     Message,
+    ProcessTickResult,
     RefreshQueueResult,
     ResolveFirstUrlResult,
+    SetEnabledResult,
 } from '../shared/messages.js';
 import { send } from '../shared/messages.js';
-import { queueStore, stateStore } from '../shared/storage.js';
+import {
+    completedStore,
+    failedStore,
+    queueStore,
+    stateStore,
+} from '../shared/storage.js';
 
 const manifest = browser.runtime.getManifest();
 
@@ -43,10 +50,16 @@ async function renderState(): Promise<void> {
 }
 
 async function renderQueue(): Promise<void> {
-    const queue = await queueStore.get();
+    const [queue, completed, failed] = await Promise.all([
+        queueStore.get(),
+        completedStore.get(),
+        failedStore.get(),
+    ]);
     const count = document.getElementById('queue-count');
     const preview = document.getElementById('queue-preview');
-    if (count) count.textContent = `(${queue.length} items)`;
+    if (count) {
+        count.textContent = `(${queue.length} queued · ${completed.length} completed · ${failed.length} failed)`;
+    }
     if (preview) {
         if (queue.length === 0) {
             preview.textContent = 'empty — click "Refresh queue" to populate.';
@@ -76,8 +89,8 @@ async function refreshAll(): Promise<void> {
     await Promise.all([renderConfig(), renderState(), renderQueue(), renderLog()]);
 }
 
-function setApiResult(text: string, isError = false): void {
-    const el = document.getElementById('api-result');
+function setResult(elId: string, text: string, isError = false): void {
+    const el = document.getElementById(elId);
     if (!el) return;
     el.textContent = text;
     el.classList.toggle('error', isError);
@@ -91,20 +104,20 @@ function setButtonsDisabled(disabled: boolean): void {
         });
 }
 
-async function runMessage<T>(message: Message, label: string): Promise<void> {
-    setApiResult(`${label}…`);
+async function runMessage<T>(message: Message, label: string, resultElId: string): Promise<void> {
+    setResult(resultElId, `${label}…`);
     setButtonsDisabled(true);
     const start = performance.now();
     try {
         const res = await send<T>(message);
         const elapsed = `${((performance.now() - start) / 1000).toFixed(1)}s`;
         if (res.ok) {
-            setApiResult(`${label} OK in ${elapsed}\n\n${JSON.stringify(res.data, null, 2)}`);
+            setResult(resultElId, `${label} OK in ${elapsed}\n\n${JSON.stringify(res.data, null, 2)}`);
         } else {
-            setApiResult(`${label} FAILED in ${elapsed}\n\n${res.error}`, true);
+            setResult(resultElId, `${label} FAILED in ${elapsed}\n\n${res.error}`, true);
         }
     } catch (err) {
-        setApiResult(`${label} threw: ${String(err)}`, true);
+        setResult(resultElId, `${label} threw: ${String(err)}`, true);
     } finally {
         setButtonsDisabled(false);
         await refreshAll();
@@ -122,14 +135,59 @@ document.getElementById('emit-test-log')?.addEventListener('click', async () => 
 
 document
     .getElementById('btn-fan-id')
-    ?.addEventListener('click', () => void runMessage<FetchFanIdResult>({ type: 'fetch-fan-id' }, 'fetch-fan-id'));
+    ?.addEventListener('click', () =>
+        void runMessage<FetchFanIdResult>({ type: 'fetch-fan-id' }, 'fetch-fan-id', 'api-result'),
+    );
 
 document
     .getElementById('btn-refresh-queue')
-    ?.addEventListener('click', () => void runMessage<RefreshQueueResult>({ type: 'refresh-queue' }, 'refresh-queue'));
+    ?.addEventListener('click', () =>
+        void runMessage<RefreshQueueResult>({ type: 'refresh-queue' }, 'refresh-queue', 'api-result'),
+    );
 
 document
     .getElementById('btn-resolve-first')
     ?.addEventListener('click', () =>
-        void runMessage<ResolveFirstUrlResult>({ type: 'resolve-first-url' }, 'resolve-first-url'),
+        void runMessage<ResolveFirstUrlResult>(
+            { type: 'resolve-first-url' },
+            'resolve-first-url',
+            'api-result',
+        ),
     );
+
+document
+    .getElementById('btn-tick')
+    ?.addEventListener('click', () =>
+        void runMessage<ProcessTickResult>(
+            { type: 'process-tick' },
+            'process-tick',
+            'scheduler-result',
+        ),
+    );
+
+document
+    .getElementById('btn-tick-force')
+    ?.addEventListener('click', () =>
+        void runMessage<ProcessTickResult>(
+            { type: 'process-tick', force: true },
+            'process-tick (forced)',
+            'scheduler-result',
+        ),
+    );
+
+document.getElementById('btn-toggle-enabled')?.addEventListener('click', async () => {
+    const cur = await stateStore.get();
+    await runMessage<SetEnabledResult>(
+        { type: 'set-enabled', value: !cur.enabled },
+        `set-enabled=${!cur.enabled}`,
+        'scheduler-result',
+    );
+});
+
+document.getElementById('btn-reset-state')?.addEventListener('click', () =>
+    void runMessage<{ reset: boolean }>(
+        { type: 'reset-run-state' },
+        'reset-run-state',
+        'scheduler-result',
+    ),
+);

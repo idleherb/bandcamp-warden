@@ -32,8 +32,10 @@ export interface Config {
 }
 
 export interface State {
+    enabled: boolean;
     inFlight: number | null;
     lastRunAt: string | null;
+    nextRunAt: string | null;
     todayDownloaded: number;
     todayResetAt: string;
     consecutiveFailures: number;

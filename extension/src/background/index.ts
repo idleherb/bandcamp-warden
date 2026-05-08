@@ -4,8 +4,10 @@ import type {
     FetchFanIdResult,
     Message,
     MessageResponse,
+    ProcessTickResult,
     RefreshQueueResult,
     ResolveFirstUrlResult,
+    SetEnabledResult,
 } from '../shared/messages.js';
 import { queueStore, stateStore } from '../shared/storage.js';
 import {
@@ -13,8 +15,17 @@ import {
     paginateCollection,
     resolveSignedDownloadUrl,
 } from './api.js';
+import { dailyResetIfNeeded, shouldRunNow } from './pacing.js';
+import {
+    markCompleted,
+    markFailed,
+    popNextItem,
+    recoverOrphanedInFlight,
+    resetRunState,
+} from './queue.js';
 
 const VERSION = browser.runtime.getManifest().version;
+const ALARM_NAME = 'warden-tick';
 
 void browser.browserAction.setBadgeBackgroundColor({ color: '#629aa9' });
 
@@ -40,15 +51,65 @@ function describeError(err: unknown): string {
     }
 }
 
+interface TickResult {
+    run: boolean;
+    reason?: string;
+    itemId?: number;
+}
+
+// Stub "download": Phase 5 swaps this for a real browser.downloads.download()
+// + onChanged listener. For now it just logs the URL it WOULD fetch and
+// completes instantly — gives Phase 4 a working state machine to test.
+async function stubDownload(itemId: number, downloadPageUrl: string): Promise<void> {
+    void log.info(`[STUB] would download item ${itemId} via ${downloadPageUrl.slice(0, 80)}…`);
+}
+
+async function processOneTick(force = false): Promise<TickResult> {
+    await stateStore.update((s) => dailyResetIfNeeded(s));
+    const [state, config] = await Promise.all([stateStore.get(), configStore.get()]);
+    const decision = shouldRunNow(state, config, new Date(), {
+        ignoreCooldown: force,
+        ignoreDisabled: force,
+    });
+    if (!decision.run) {
+        return { run: false, reason: decision.reason };
+    }
+    const item = await popNextItem();
+    if (!item) {
+        await log.info('tick: queue is empty, nothing to do');
+        return { run: false, reason: 'queue-empty' };
+    }
+    void log.info(`tick: processing ${item.bandName} — ${item.itemTitle} (id=${item.id})`);
+    try {
+        await stubDownload(item.id, item.downloadPageUrl);
+        await markCompleted(item.id);
+        return { run: true, itemId: item.id };
+    } catch (err) {
+        await markFailed(item.id, describeError(err));
+        return { run: false, reason: `failed: ${describeError(err)}` };
+    }
+}
+
+browser.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name !== ALARM_NAME) return;
+    void processOneTick().catch((err) => log.error(`alarm tick threw: ${describeError(err)}`));
+});
+
+async function ensureAlarm(): Promise<void> {
+    const existing = await browser.alarms.get(ALARM_NAME);
+    if (!existing) {
+        await browser.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
+        await log.info(`alarm '${ALARM_NAME}' created (periodInMinutes=1)`);
+    }
+}
+
 async function handleMessage(message: Message): Promise<MessageResponse> {
     try {
         switch (message.type) {
             case 'fetch-fan-id': {
                 await log.info('fetch-fan-id requested');
                 const ctx = await fetchHomepageContext();
-                await log.info(
-                    `fan_id=${ctx.fanId}, verified=${ctx.isFanVerified}`,
-                );
+                await log.info(`fan_id=${ctx.fanId}, verified=${ctx.isFanVerified}`);
                 const data: FetchFanIdResult = ctx;
                 return { ok: true, data };
             }
@@ -97,6 +158,24 @@ async function handleMessage(message: Message): Promise<MessageResponse> {
                 await log.info(`resolved: ${signed.slice(0, 80)}…`);
                 return { ok: true, data };
             }
+            case 'process-tick': {
+                const result = await processOneTick(message.force === true);
+                const decision: ProcessTickResult['decision'] = result.run
+                    ? { run: true, itemId: result.itemId! }
+                    : { run: false, reason: result.reason ?? 'unknown' };
+                const data: ProcessTickResult = { decision };
+                return { ok: true, data };
+            }
+            case 'set-enabled': {
+                await stateStore.update((s) => ({ ...s, enabled: message.value }));
+                await log.info(`enabled = ${message.value}`);
+                const data: SetEnabledResult = { enabled: message.value };
+                return { ok: true, data };
+            }
+            case 'reset-run-state': {
+                await resetRunState();
+                return { ok: true, data: { reset: true } };
+            }
         }
     } catch (err) {
         const error = describeError(err);
@@ -110,4 +189,7 @@ browser.runtime.onMessage.addListener((message: Message) => handleMessage(messag
 void Promise.all([
     configStore.update((c) => c),
     stateStore.update((s) => s),
-]).then(() => log.info(`background script loaded, version ${VERSION}`));
+])
+    .then(() => recoverOrphanedInFlight())
+    .then(() => ensureAlarm())
+    .then(() => log.info(`background script loaded, version ${VERSION}`));
