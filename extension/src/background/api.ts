@@ -31,6 +31,12 @@ interface CollectionItemRaw {
     item_title?: string;
     token?: string;
     item_type?: string;
+    item_url?: string;
+    tralbum_type?: string;
+    featured_track_title?: string;
+    purchased?: string | number;
+    added?: string | number;
+    art_id?: number;
 }
 
 interface CollectionResponse {
@@ -69,6 +75,18 @@ function parseBlob<T>(html: string, divId: string): T {
 function asPositiveNumber(v: unknown): number | null {
     const n = typeof v === 'string' ? Number(v) : v;
     return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function formatBandcampDate(v: unknown): string | undefined {
+    // Bandcamp's collection_items returns purchased/added as either a Unix
+    // epoch (seconds) or a pre-formatted "DD MMM YYYY HH:MM:SS GMT" string.
+    // Existing bandcamp_<id>.json entries use the GMT string form, so we
+    // normalize both to that.
+    if (typeof v === 'string' && v.length > 0) return v;
+    if (typeof v === 'number' && Number.isFinite(v)) {
+        return new Date(v * 1000).toUTCString();
+    }
+    return undefined;
 }
 
 export interface HomepageContext {
@@ -161,6 +179,12 @@ export async function paginateCollection(
                 bandName: r.band_name ?? '',
                 itemTitle: r.item_title ?? '',
                 downloadPageUrl: url,
+                itemUrl: typeof r.item_url === 'string' && r.item_url.length > 0 ? r.item_url : undefined,
+                tralbumType: r.tralbum_type ?? r.sale_item_type,
+                featuredTrack: r.featured_track_title,
+                purchasedAt: formatBandcampDate(r.purchased),
+                addedAt: formatBandcampDate(r.added),
+                artId: typeof r.art_id === 'number' && Number.isFinite(r.art_id) && r.art_id > 0 ? r.art_id : undefined,
             });
             pageAdded++;
         }

@@ -3,6 +3,15 @@ export interface QueueItem {
     bandName: string;
     itemTitle: string;
     downloadPageUrl: string;
+    // Rich fields captured at refresh time. Optional so older stored queues
+    // don't fail validation; sidecar's inbox watcher falls back to Fan API
+    // when these are missing.
+    itemUrl?: string;
+    tralbumType?: string;
+    featuredTrack?: string;
+    purchasedAt?: string;
+    addedAt?: string;
+    artId?: number;
 }
 
 export interface FailedItem {
