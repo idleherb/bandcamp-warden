@@ -960,9 +960,30 @@ _BANDCAMPSYNC_FORBIDDEN = '"#%\'*/?\\`:'
 
 def clean_path_component(name: str) -> str:
     """Filesystem-safe component matching bandcampsync's LocalMedia._clean_path.
-    Preserves unicode + case (these go into human-visible folder names)."""
-    cleaned = ''.join(c for c in (name or '') if c not in _BANDCAMPSYNC_FORBIDDEN)
-    cleaned = cleaned.strip().rstrip('. ')
+
+    The non-obvious bit: bandcampsync NFKD-normalizes before writing, which
+    decomposes Mathematical Bold / Double-struck / Fullwidth Latin into
+    plain ASCII (𝔸𝕧𝕣𝕚𝕝 → Avril), then drops combining marks (Mn) and
+    format characters (Cf — zero-width joiners, etc.). CJK ideographs
+    pass through untouched because NFKD doesn't decompose them.
+
+    If we don't replicate this exactly, my output collides with neither
+    the existing 295 album folders nor what bandcampsync would have
+    written, producing a parallel namespace and breaking the Idempotency
+    check in _process_one. Verified empirically on item 2392412674
+    (𝔸𝕧𝕣𝕚𝕝 — 𝔸𝕧𝕣𝕚𝕝 𝟚) — must collapse to "Avril/Avril 2".
+    """
+    import unicodedata
+    decomposed = unicodedata.normalize("NFKD", name or "")
+    cleaned = "".join(
+        c for c in decomposed
+        if c not in _BANDCAMPSYNC_FORBIDDEN
+        and unicodedata.category(c) not in ("Cf", "Mn")
+    )
+    # Only strip whitespace, NOT trailing periods — bandcampsync keeps
+    # them. Verified against existing folder "猫 シ Corp." in user's
+    # library (/downloads/猫 シ Corp./Blueberries on Mars).
+    cleaned = cleaned.strip()
     return cleaned or '_unknown'
 
 
