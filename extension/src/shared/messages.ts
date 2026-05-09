@@ -5,7 +5,9 @@ export type Message =
     | { type: 'process-tick'; force?: boolean }
     | { type: 'set-enabled'; value: boolean }
     | { type: 'reset-run-state' }
-    | { type: 'reset-config' };
+    | { type: 'reset-config' }
+    | { type: 'save-config'; config: Partial<import('./types.js').Config> }
+    | { type: 'test-sidecar' };
 
 export interface FetchFanIdResult {
     fanId: number;
@@ -31,6 +33,19 @@ export interface ProcessTickResult {
 
 export interface SetEnabledResult {
     enabled: boolean;
+}
+
+export interface SaveConfigResult {
+    config: import('./types.js').Config;
+}
+
+export interface TestSidecarResult {
+    ok: boolean;
+    statusCode: number | null;
+    statusText: string;
+    durationMs: number;
+    sidecarVersion?: string;
+    inboxStatus?: unknown;
 }
 
 export type MessageResponse<T = unknown> =

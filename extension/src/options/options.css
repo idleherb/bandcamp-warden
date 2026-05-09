@@ -112,6 +112,43 @@ pre.result.error {
     border-color: #5c2a25;
 }
 
+#config-form {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.6rem 1rem;
+    margin: 0.75rem 0;
+}
+
+#config-form label {
+    display: flex;
+    flex-direction: column;
+    font-size: 0.8rem;
+    color: #888;
+    gap: 0.25rem;
+}
+
+#config-form input,
+#config-form select {
+    background: #0f0f0f;
+    color: #e0e0e0;
+    border: 1px solid #2a2a2a;
+    border-radius: 3px;
+    padding: 0.35rem 0.5rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+}
+
+#config-form input:focus,
+#config-form select:focus {
+    outline: none;
+    border-color: #629aa9;
+}
+
+#config-form .buttons {
+    grid-column: 1 / -1;
+    margin-top: 0.5rem;
+}
+
 ol#log {
     list-style: decimal inside;
     padding: 0;

@@ -11,8 +11,59 @@
         <p id="version"></p>
 
         <section>
-            <h2>Config</h2>
-            <table id="config"></table>
+            <h2>Configuration <button id="btn-reset-config" type="button">Reset to defaults</button></h2>
+            <form id="config-form" autocomplete="off">
+                <label>Transport
+                    <select name="transport">
+                        <option value="sidecar-upload">sidecar-upload (HTTP, recommended)</option>
+                        <option value="browser-download">browser-download (SMB / local)</option>
+                    </select>
+                </label>
+                <label>Sidecar base URL
+                    <input type="text" name="sidecarBaseUrl" placeholder="http://homeserver:31080" />
+                </label>
+                <label>Sidecar auth token
+                    <input type="password" name="sidecarAuthToken" placeholder="paste WARDEN_INBOX_UPLOAD_AUTH_TOKEN value" />
+                </label>
+                <label>Daily quota
+                    <input type="number" name="dailyQuota" min="1" max="9999" />
+                </label>
+                <label>Format
+                    <select name="format">
+                        <option value="flac">flac</option>
+                        <option value="mp3-320">mp3-320</option>
+                        <option value="mp3-v0">mp3-v0</option>
+                        <option value="aac-hi">aac-hi</option>
+                        <option value="vorbis">vorbis</option>
+                        <option value="alac">alac</option>
+                        <option value="wav">wav</option>
+                        <option value="aiff-lossless">aiff-lossless</option>
+                    </select>
+                </label>
+                <label>Min delay (sec)
+                    <input type="number" name="minDelaySec" min="0" max="3600" />
+                </label>
+                <label>Max delay (sec)
+                    <input type="number" name="maxDelaySec" min="0" max="3600" />
+                </label>
+                <label>Circuit breaker threshold
+                    <input type="number" name="circuitBreakerThreshold" min="1" max="100" />
+                </label>
+                <label>Circuit breaker pause (sec)
+                    <input type="number" name="circuitBreakerPauseSec" min="60" max="86400" />
+                </label>
+                <label>Inbox subfolder (browser-download only)
+                    <input type="text" name="inboxSubfolder" />
+                </label>
+                <label>Max upload size (bytes)
+                    <input type="number" name="maxUploadBytes" min="1048576" />
+                </label>
+                <div class="buttons">
+                    <button id="btn-save-config" type="submit">Save</button>
+                    <button id="btn-test-sidecar" type="button">Test sidecar</button>
+                </div>
+            </form>
+            <pre id="config-result" class="result"></pre>
         </section>
 
         <section>
@@ -41,15 +92,14 @@
         <section>
             <h2>Scheduler</h2>
             <p class="muted small">
-                Phase 4 stub — "downloads" do not actually fetch ZIPs yet, but the
-                queue/state machine is real. Items popped here move to <code>completed</code>.
+                "Process one tick (force)" downloads exactly one item now (bypasses
+                cooldown + enabled flag). Toggle enabled to run autonomously.
             </p>
             <div class="buttons">
                 <button id="btn-tick" type="button">Process one tick</button>
                 <button id="btn-tick-force" type="button">Process one tick (force)</button>
                 <button id="btn-toggle-enabled" type="button">Toggle enabled</button>
                 <button id="btn-reset-state" type="button">Reset run state</button>
-                <button id="btn-reset-config" type="button">Reset config to defaults</button>
             </div>
             <pre id="scheduler-result" class="result"></pre>
         </section>

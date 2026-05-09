@@ -6,7 +6,9 @@ import type {
     ProcessTickResult,
     RefreshQueueResult,
     ResolveFirstUrlResult,
+    SaveConfigResult,
     SetEnabledResult,
+    TestSidecarResult,
 } from '../shared/messages.js';
 import { send } from '../shared/messages.js';
 import {
@@ -15,8 +17,32 @@ import {
     queueStore,
     stateStore,
 } from '../shared/storage.js';
+import type { Config } from '../shared/types.js';
 
 const manifest = browser.runtime.getManifest();
+
+const CONFIG_FIELDS = [
+    'transport',
+    'sidecarBaseUrl',
+    'sidecarAuthToken',
+    'dailyQuota',
+    'format',
+    'minDelaySec',
+    'maxDelaySec',
+    'circuitBreakerThreshold',
+    'circuitBreakerPauseSec',
+    'inboxSubfolder',
+    'maxUploadBytes',
+] as const;
+
+const NUMBER_FIELDS = new Set<(typeof CONFIG_FIELDS)[number]>([
+    'dailyQuota',
+    'minDelaySec',
+    'maxDelaySec',
+    'circuitBreakerThreshold',
+    'circuitBreakerPauseSec',
+    'maxUploadBytes',
+]);
 
 function setVersion(): void {
     const el = document.getElementById('version');
@@ -41,8 +67,19 @@ function renderTable(tableId: string, rows: Record<string, unknown>): void {
     );
 }
 
-async function renderConfig(): Promise<void> {
-    renderTable('config', (await configStore.get()) as unknown as Record<string, unknown>);
+async function renderConfigForm(): Promise<void> {
+    const cfg = await configStore.get();
+    const form = document.getElementById('config-form') as HTMLFormElement | null;
+    if (!form) return;
+    for (const field of CONFIG_FIELDS) {
+        const input = form.elements.namedItem(field) as
+            | HTMLInputElement
+            | HTMLSelectElement
+            | null;
+        if (!input) continue;
+        const v = (cfg as unknown as Record<string, unknown>)[field];
+        input.value = v === undefined || v === null ? '' : String(v);
+    }
 }
 
 async function renderState(): Promise<void> {
@@ -86,7 +123,7 @@ async function renderLog(): Promise<void> {
 }
 
 async function refreshAll(): Promise<void> {
-    await Promise.all([renderConfig(), renderState(), renderQueue(), renderLog()]);
+    await Promise.all([renderConfigForm(), renderState(), renderQueue(), renderLog()]);
 }
 
 function setResult(elId: string, text: string, isError = false): void {
@@ -98,7 +135,7 @@ function setResult(elId: string, text: string, isError = false): void {
 
 function setButtonsDisabled(disabled: boolean): void {
     document
-        .querySelectorAll<HTMLButtonElement>('section .buttons button')
+        .querySelectorAll<HTMLButtonElement>('section .buttons button, button#btn-save-config, button#btn-test-sidecar, button#btn-reset-config')
         .forEach((b) => {
             b.disabled = disabled;
         });
@@ -124,8 +161,84 @@ async function runMessage<T>(message: Message, label: string, resultElId: string
     }
 }
 
+function readFormConfig(): Partial<Config> {
+    const form = document.getElementById('config-form') as HTMLFormElement | null;
+    if (!form) return {};
+    const out: Partial<Config> = {};
+    for (const field of CONFIG_FIELDS) {
+        const input = form.elements.namedItem(field) as
+            | HTMLInputElement
+            | HTMLSelectElement
+            | null;
+        if (!input) continue;
+        const raw = input.value;
+        if (NUMBER_FIELDS.has(field)) {
+            const n = Number(raw);
+            if (Number.isFinite(n)) {
+                (out as Record<string, unknown>)[field] = n;
+            }
+        } else {
+            (out as Record<string, unknown>)[field] = raw;
+        }
+    }
+    return out;
+}
+
+async function ensureSidecarPermission(baseUrl: string): Promise<boolean> {
+    if (!baseUrl) return true;
+    let origin: string;
+    try {
+        const u = new URL(baseUrl);
+        origin = `${u.protocol}//${u.host}/*`;
+    } catch {
+        return true;
+    }
+    const has = await browser.permissions.contains({ origins: [origin] });
+    if (has) return true;
+    // permissions.request() must be called from a user-gesture context
+    // (button click), which this is.
+    return browser.permissions.request({ origins: [origin] });
+}
+
+async function handleSaveConfig(event: Event): Promise<void> {
+    event.preventDefault();
+    const partial = readFormConfig();
+    if (typeof partial.sidecarBaseUrl === 'string' && partial.sidecarBaseUrl) {
+        const granted = await ensureSidecarPermission(partial.sidecarBaseUrl);
+        if (!granted) {
+            setResult(
+                'config-result',
+                `Permission denied for ${partial.sidecarBaseUrl}. Cannot save until granted.`,
+                true,
+            );
+            return;
+        }
+    }
+    await runMessage<SaveConfigResult>(
+        { type: 'save-config', config: partial },
+        'save-config',
+        'config-result',
+    );
+}
+
 setVersion();
 void refreshAll();
+
+document.getElementById('config-form')?.addEventListener('submit', (e) => void handleSaveConfig(e));
+document.getElementById('btn-test-sidecar')?.addEventListener('click', () =>
+    void runMessage<TestSidecarResult>(
+        { type: 'test-sidecar' },
+        'test-sidecar',
+        'config-result',
+    ),
+);
+document.getElementById('btn-reset-config')?.addEventListener('click', () =>
+    void runMessage<{ reset: boolean }>(
+        { type: 'reset-config' },
+        'reset-config',
+        'config-result',
+    ),
+);
 
 document.getElementById('refresh-log')?.addEventListener('click', () => void refreshAll());
 document.getElementById('emit-test-log')?.addEventListener('click', async () => {
@@ -188,14 +301,6 @@ document.getElementById('btn-reset-state')?.addEventListener('click', () =>
     void runMessage<{ reset: boolean }>(
         { type: 'reset-run-state' },
         'reset-run-state',
-        'scheduler-result',
-    ),
-);
-
-document.getElementById('btn-reset-config')?.addEventListener('click', () =>
-    void runMessage<{ reset: boolean }>(
-        { type: 'reset-config' },
-        'reset-config',
         'scheduler-result',
     ),
 );

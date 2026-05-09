@@ -17,6 +17,10 @@
         "https://bandcamp.com/*",
         "https://*.bandcamp.com/*"
     ],
+    "optional_permissions": [
+        "http://*/*",
+        "https://*/*"
+    ],
     "background": {
         "scripts": ["src/background/index.ts"],
         "persistent": true

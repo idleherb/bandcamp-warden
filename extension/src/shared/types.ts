@@ -31,6 +31,8 @@ export type DownloadFormat =
     | 'wav'
     | 'aiff-lossless';
 
+export type Transport = 'sidecar-upload' | 'browser-download';
+
 export interface Config {
     dailyQuota: number;
     format: DownloadFormat;
@@ -38,7 +40,20 @@ export interface Config {
     maxDelaySec: number;
     circuitBreakerThreshold: number;
     circuitBreakerPauseSec: number;
+    // Where the ZIP ends up.
+    //   sidecar-upload: extension fetches from Bandcamp (browser identity),
+    //     POSTs the bytes to the sidecar's /inbox/upload — no SMB involved.
+    //   browser-download: legacy. Firefox writes via its default download
+    //     dir (must be the SMB-mounted inbox to be useful).
+    transport: Transport;
+    sidecarBaseUrl: string;
+    sidecarAuthToken: string;
+    // Only used when transport = browser-download. Subfolder under
+    // Firefox's default download directory.
     inboxSubfolder: string;
+    // Hard cap for sidecar-upload; rejects tracks/albums that would
+    // never fit anyway (defaults match the sidecar's max).
+    maxUploadBytes: number;
 }
 
 export interface State {

@@ -7,7 +7,9 @@ import type {
     ProcessTickResult,
     RefreshQueueResult,
     ResolveFirstUrlResult,
+    SaveConfigResult,
     SetEnabledResult,
+    TestSidecarResult,
 } from '../shared/messages.js';
 import { completedStore, queueStore, stateStore } from '../shared/storage.js';
 import {
@@ -78,7 +80,7 @@ async function processOneTick(force = false): Promise<TickResult> {
     }
     void log.info(`tick: processing ${item.bandName} — ${item.itemTitle} (id=${item.id})`);
     try {
-        await downloadItem(item, config.format, config.inboxSubfolder);
+        await downloadItem(item, config);
         await markCompleted(item.id);
         return { run: true, itemId: item.id };
     } catch (err) {
@@ -189,6 +191,37 @@ async function handleMessage(message: Message): Promise<MessageResponse> {
                 await configStore.set({ ...DEFAULT_CONFIG });
                 await log.info('config reset to defaults');
                 return { ok: true, data: { reset: true } };
+            }
+            case 'save-config': {
+                const next = await configStore.update((cur) => ({ ...cur, ...message.config }));
+                await log.info(
+                    `config saved (transport=${next.transport}, sidecar=${next.sidecarBaseUrl})`,
+                );
+                const data: SaveConfigResult = { config: next };
+                return { ok: true, data };
+            }
+            case 'test-sidecar': {
+                const cfg = await configStore.get();
+                if (!cfg.sidecarBaseUrl) throw new Error('sidecarBaseUrl is empty');
+                const url = `${cfg.sidecarBaseUrl.replace(/\/+$/, '')}/inbox-status`;
+                const start = performance.now();
+                const res = await fetch(url, { method: 'GET' });
+                const durationMs = performance.now() - start;
+                const text = await res.text();
+                let body: unknown = null;
+                try {
+                    body = JSON.parse(text);
+                } catch {
+                    body = text.slice(0, 200);
+                }
+                const data: TestSidecarResult = {
+                    ok: res.ok,
+                    statusCode: res.status,
+                    statusText: res.statusText,
+                    durationMs,
+                    inboxStatus: body,
+                };
+                return { ok: true, data };
             }
         }
     } catch (err) {
