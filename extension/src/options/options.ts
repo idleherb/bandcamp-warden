@@ -135,8 +135,14 @@ function setResult(elId: string, text: string, isError = false): void {
 }
 
 function setButtonsDisabled(disabled: boolean): void {
+    // Reset-run-state is the emergency-stop. It must stay clickable even
+    // when another operation is in flight, otherwise a runaway download
+    // (e.g. a 25 GB compilation) can't be aborted from the UI.
     document
-        .querySelectorAll<HTMLButtonElement>('section .buttons button, button#btn-save-config, button#btn-test-sidecar, button#btn-reset-config')
+        .querySelectorAll<HTMLButtonElement>(
+            'section .buttons button:not(#btn-reset-state), ' +
+            'button#btn-save-config, button#btn-test-sidecar, button#btn-reset-config',
+        )
         .forEach((b) => {
             b.disabled = disabled;
         });

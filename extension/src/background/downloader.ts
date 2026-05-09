@@ -87,11 +87,31 @@ async function uploadViaSidecar(
         if (!bandcampResp.ok) {
             throw new Error(`bandcamp fetch ${bandcampResp.status} ${bandcampResp.statusText}`);
         }
+        // Bail BEFORE reading the body for items above the size cap —
+        // otherwise a 25 GB compilation lands as a Blob in extension RAM
+        // and either OOM-kills Firefox or grinds it to a halt. Content-
+        // Length is reliable for Bandcamp's CDN responses.
+        const claimedLength = parseInt(
+            bandcampResp.headers.get('content-length') ?? '0', 10,
+        );
+        if (claimedLength > 0 && claimedLength > config.maxUploadBytes) {
+            // Drain the body so the connection closes cleanly — never
+            // actually read into a Blob. cancel() releases the response.
+            await bandcampResp.body?.cancel().catch(() => {});
+            throw new Error(
+                `item too large for sidecar-upload: content-length=${claimedLength} ` +
+                `(${(claimedLength / (1024 * 1024 * 1024)).toFixed(1)} GB) ` +
+                `exceeds maxUploadBytes=${config.maxUploadBytes} ` +
+                `(${(config.maxUploadBytes / (1024 * 1024 * 1024)).toFixed(1)} GB). ` +
+                `Raise the limit in Options if your machine has the RAM, or use ` +
+                `browser-download transport for this one.`,
+            );
+        }
         // Read body via ReadableStream so we can log progress every few
         // seconds — without this, a stalled CDN connection looks identical
         // to a working slow download for many minutes. Memory cost is the
         // same as response.blob() since chunks are held until Blob is built.
-        blob = await readWithProgress(bandcampResp, item.id);
+        blob = await readWithProgress(bandcampResp, item.id, config.maxUploadBytes);
     } finally {
         clearTimeout(fetchTimer);
     }
@@ -149,7 +169,11 @@ function buildUploadUrl(baseUrl: string, itemId: number): string {
 
 const PROGRESS_LOG_INTERVAL_MS = 5000;
 
-async function readWithProgress(response: Response, itemId: number): Promise<Blob> {
+async function readWithProgress(
+    response: Response,
+    itemId: number,
+    maxBytes: number,
+): Promise<Blob> {
     if (!response.body) {
         // Some Firefox builds don't expose body on a Response; fall back to
         // .blob() and lose progress visibility for that one download.
@@ -174,8 +198,20 @@ async function readWithProgress(response: Response, itemId: number): Promise<Blo
             const { done, value } = await reader.read();
             if (done) break;
             if (!value) continue;
-            chunks.push(value as BlobPart);
             received += value.byteLength;
+            // Backstop in case Content-Length lied or was missing — bail
+            // before chunks pile up past the configured cap. The early
+            // pre-read content-length check upstream catches the common
+            // case; this catches chunked-encoding and missing-header
+            // edge cases.
+            if (received > maxBytes) {
+                await reader.cancel().catch(() => {});
+                throw new Error(
+                    `item ${itemId}: stream exceeded maxUploadBytes=${maxBytes} ` +
+                    `mid-download (received ${received}); aborted to protect RAM`,
+                );
+            }
+            chunks.push(value as BlobPart);
             const now = performance.now();
             if (now - lastLogAt >= PROGRESS_LOG_INTERVAL_MS) {
                 const pct = total > 0 ? ` (${((received / total) * 100).toFixed(1)}%)` : '';
