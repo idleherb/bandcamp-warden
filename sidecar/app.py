@@ -13,13 +13,16 @@ channel; the HTTP endpoints are for LAN-side spot-checks.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import urllib.parse
+import zipfile
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
@@ -32,7 +35,7 @@ import docker.errors
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -105,6 +108,41 @@ class Settings(BaseSettings):
     # Telegram
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+
+    # Inbox watcher (Phase 8b — picks up ZIPs the Plan-E Firefox extension
+    # drops in <downloads>/_inbox/ and finalizes them: extract → Artist/Album/,
+    # write bandcamp_<id>.json, append to ignores.txt, delete ZIP).
+    # Off by default until validated end-to-end on the live system.
+    inbox_watcher_enabled: bool = False
+    inbox_subfolder: str = "_inbox"
+    inbox_poll_seconds: int = 30
+    # Quarantine sits inside the inbox so it's visible from the same SMB share.
+    inbox_quarantine_subfolder: str = "_inbox/_quarantine"
+    # Skip ZIPs newer than this — gives Firefox time to finish writing before
+    # we try to read. Cheaper than a size-stability poll and good enough on
+    # SMB where stat() can lie about size during in-flight writes.
+    inbox_min_file_age_seconds: int = 30
+    # Fan API metadata cache TTL. We refresh on cache miss anyway, so a
+    # generous TTL just bounds memory use of stale rows.
+    inbox_api_cache_ttl_seconds: int = 3600
+    # When inbox watcher is the production path, the daily bandcampsync
+    # kickoff should be off (extension owns the downloads now). Setting
+    # this skips registering the daily_kickoff cron job.
+    daily_kickoff_enabled: bool = True
+
+    # Phase 8c — HTTP upload endpoint. When the token is set, the
+    # POST /inbox/upload endpoint accepts streamed ZIPs from the Plan-E
+    # browser extension and writes them directly to the inbox without
+    # the SMB round-trip. Empty token disables the endpoint entirely
+    # (it returns 503), so a default install can't be abused as an
+    # open file drop.
+    inbox_upload_auth_token: str = ""
+    # Reject uploads larger than this (bytes). 2 GB is generous; biggest
+    # Bandcamp lossless albums sit well under 1 GB.
+    inbox_upload_max_bytes: int = 2 * 1024 * 1024 * 1024
+    # How long .partial files may sit before the watcher's janitor sweeps
+    # them. Covers extension-side aborts mid-upload. 1h is conservative.
+    inbox_partial_max_age_seconds: int = 3600
 
     # Docker network the bandcampsync container should attach to (optional).
     docker_network: str | None = None
@@ -911,6 +949,405 @@ class MetadataEnricher:
         }
 
 
+# ---------- Inbox Watcher (Phase 8b) ----------
+
+# bandcampsync's filesystem character set, replicated for output sanitization.
+# Same disallowed set the existing 295 album folders were named with — keeps
+# new arrivals collision-free against backfill_metadata's matcher.
+_BANDCAMPSYNC_FORBIDDEN = '"#%\'*/?\\`:'
+
+
+def clean_path_component(name: str) -> str:
+    """Filesystem-safe component matching bandcampsync's LocalMedia._clean_path.
+    Preserves unicode + case (these go into human-visible folder names)."""
+    cleaned = ''.join(c for c in (name or '') if c not in _BANDCAMPSYNC_FORBIDDEN)
+    cleaned = cleaned.strip().rstrip('. ')
+    return cleaned or '_unknown'
+
+
+_AUDIO_EXTS = {'.flac', '.mp3', '.m4a', '.ogg', '.wav', '.aiff', '.aif', '.opus'}
+
+
+def _detect_zip_root_prefix(names: list[str]) -> str:
+    """If every entry in the ZIP shares a common top-level folder prefix,
+    return it (with trailing slash). Otherwise return ''. Bandcamp ZIPs vary
+    — sometimes flat, sometimes wrapped in '<Artist> - <Album>/'."""
+    if not names:
+        return ''
+    first = names[0].split('/', 1)[0]
+    if not first or first == names[0]:
+        return ''
+    prefix = first + '/'
+    for n in names:
+        if not n.startswith(prefix):
+            return ''
+    return prefix
+
+
+class InboxWatcher:
+    """Polls <downloads>/_inbox/ for ZIPs the Plan-E extension dropped (or
+    POSTed via /inbox/upload), looks each item up via the Fan API metadata
+    cache, extracts into <Artist>/<Album>/, writes bandcamp_<id>.json,
+    appends to ignores.txt, deletes the ZIP."""
+
+    _FILENAME_RE = re.compile(r'^bandcamp_(\d+)\.zip$')
+
+    def __init__(
+        self,
+        config_view: Path,
+        downloads_view: Path,
+        metadata_enricher: MetadataEnricher,
+        telegram: Telegram,
+    ) -> None:
+        self.config_view = config_view
+        self.downloads_view = downloads_view
+        self.metadata_enricher = metadata_enricher
+        self.telegram = telegram
+        self.inbox_path = downloads_view / settings.inbox_subfolder
+        self.quarantine_path = downloads_view / settings.inbox_quarantine_subfolder
+        self._stop = asyncio.Event()
+        self._api_cache: dict[int, dict] = {}
+        self._api_cache_at: datetime | None = None
+        self._processed_count = 0
+        self._quarantined_count = 0
+        self._last_processed_at: datetime | None = None
+        self._last_error: str | None = None
+
+    def status(self) -> dict:
+        """Snapshot for /inbox-status endpoint."""
+        try:
+            pending = sorted(p.name for p in self.inbox_path.glob('bandcamp_*.zip'))
+        except OSError as e:
+            pending = []
+            self._last_error = f'pending listing failed: {e}'
+        try:
+            partials = sorted(
+                p.name for p in self.inbox_path.glob('bandcamp_*.zip.partial')
+            )
+        except OSError:
+            partials = []
+        try:
+            quarantined = sorted(
+                p.name for p in self.quarantine_path.glob('bandcamp_*.zip')
+            )
+        except OSError:
+            quarantined = []
+        return {
+            'enabled': settings.inbox_watcher_enabled,
+            'inbox_path': str(self.inbox_path),
+            'quarantine_path': str(self.quarantine_path),
+            'pending': pending,
+            'partials': partials,
+            'quarantined': quarantined,
+            'pending_count': len(pending),
+            'partials_count': len(partials),
+            'quarantined_count': len(quarantined),
+            'processed_total': self._processed_count,
+            'quarantined_total': self._quarantined_count,
+            'last_processed_at': (
+                self._last_processed_at.isoformat() if self._last_processed_at else None
+            ),
+            'api_cache_size': len(self._api_cache),
+            'api_cache_at': (
+                self._api_cache_at.isoformat() if self._api_cache_at else None
+            ),
+            'last_error': self._last_error,
+        }
+
+    async def run_loop(self) -> None:
+        """Poll forever until stopped. Errors are caught per-iteration so
+        a transient hiccup (e.g. SMB blip on the dataset) doesn't kill
+        the loop. Slowing or speeding the cadence happens via the
+        inbox_poll_seconds setting; default 30s."""
+        log.info('inbox watcher starting (path=%s)', self.inbox_path)
+        try:
+            self.inbox_path.mkdir(parents=True, exist_ok=True)
+            self.quarantine_path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.error('inbox watcher setup failed: %s', e)
+            self._last_error = str(e)
+            return
+        while not self._stop.is_set():
+            try:
+                await self._sweep_partials()
+                await self._process_pending()
+            except Exception as e:
+                self._last_error = f'{type(e).__name__}: {e}'
+                log.exception('inbox watcher sweep raised')
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=settings.inbox_poll_seconds
+                )
+            except asyncio.TimeoutError:
+                pass
+        log.info('inbox watcher stopped')
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    async def _sweep_partials(self) -> None:
+        """Delete .partial files older than the configured TTL — they're
+        leftovers from upload-aborts and won't be completed."""
+        cutoff = datetime.now(timezone.utc).timestamp() - settings.inbox_partial_max_age_seconds
+        try:
+            partials = list(self.inbox_path.glob('bandcamp_*.zip.partial'))
+        except OSError:
+            return
+        for p in partials:
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    log.info('inbox: swept stale .partial: %s', p.name)
+            except OSError:
+                continue
+
+    async def _process_pending(self) -> None:
+        """One sweep of the inbox. Reads the directory, picks ZIPs that
+        are old enough to be considered fully written, processes them
+        sequentially. Sequential is intentional — extracting multiple
+        500MB ZIPs in parallel would thrash any home-NAS disk."""
+        try:
+            zips = sorted(self.inbox_path.glob('bandcamp_*.zip'))
+        except OSError as e:
+            self._last_error = f'inbox listing failed: {e}'
+            return
+        if not zips:
+            return
+        cutoff = datetime.now(timezone.utc).timestamp() - settings.inbox_min_file_age_seconds
+        ready: list[tuple[int, Path]] = []
+        for zp in zips:
+            try:
+                mtime = zp.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > cutoff:
+                continue
+            m = self._FILENAME_RE.match(zp.name)
+            if not m:
+                log.warning('inbox: filename does not match pattern, ignoring: %s', zp.name)
+                continue
+            ready.append((int(m.group(1)), zp))
+        if not ready:
+            return
+
+        # If any ID isn't in our cached API map, refresh the cache once.
+        await self._ensure_api_cache(needed_ids=[iid for iid, _ in ready])
+
+        for item_id, zp in ready:
+            api_row = self._api_cache.get(item_id)
+            try:
+                await asyncio.to_thread(
+                    self._process_one, item_id, zp, api_row
+                )
+            except Exception as e:
+                self._last_error = f'item {item_id}: {type(e).__name__}: {e}'
+                log.exception('inbox: processing item %d raised', item_id)
+
+    async def _ensure_api_cache(self, needed_ids: list[int]) -> None:
+        """Refresh the cache if any needed_id is missing or TTL expired."""
+        now = datetime.now(timezone.utc)
+        ttl_ok = (
+            self._api_cache_at is not None
+            and (now - self._api_cache_at).total_seconds()
+            < settings.inbox_api_cache_ttl_seconds
+        )
+        all_present = ttl_ok and all(iid in self._api_cache for iid in needed_ids)
+        if all_present:
+            return
+        log.info(
+            'inbox: refreshing Fan API cache (needed_ids=%d, cache_size=%d)',
+            len(needed_ids), len(self._api_cache),
+        )
+        try:
+            api_map = await asyncio.to_thread(
+                self.metadata_enricher._fetch_collection_sync, 0, {}
+            )
+        except Exception as e:
+            log.exception('inbox: Fan API refresh failed')
+            self._last_error = f'fan api refresh: {type(e).__name__}: {e}'
+            return
+        if api_map:
+            self._api_cache = api_map
+            self._api_cache_at = now
+
+    def _process_one(self, item_id: int, zip_path: Path, api_row: dict | None) -> None:
+        """Synchronous core: extract one ZIP, write JSON, update ignores,
+        delete original. Runs in a worker thread."""
+        if api_row is None:
+            log.warning(
+                'inbox: no Fan API row for item %d, quarantining', item_id
+            )
+            self._quarantine(zip_path, reason='no_api_row')
+            return
+
+        band = clean_path_component(api_row.get('band_name', ''))
+        title = clean_path_component(api_row.get('item_title', ''))
+        if band == '_unknown' or title == '_unknown':
+            log.warning(
+                'inbox: API row for item %d missing band/title, quarantining', item_id
+            )
+            self._quarantine(zip_path, reason='blank_band_or_title')
+            return
+        target_folder = self.downloads_view / band / title
+        json_marker = target_folder / f'bandcamp_{item_id}.json'
+
+        # Idempotency — if the canonical JSON marker already exists, this
+        # item was finalized previously. Just clean the inbox copy.
+        if json_marker.exists():
+            log.info(
+                'inbox: item %d already finalized at %s, removing inbox copy',
+                item_id, target_folder,
+            )
+            zip_path.unlink(missing_ok=True)
+            self._processed_count += 1
+            self._last_processed_at = datetime.now(timezone.utc)
+            return
+
+        # Extract into a staging folder first, then rename to the final
+        # name. If extract fails partway, the half-baked folder doesn't
+        # collide with bandcampsync's existing layout.
+        staging = target_folder.with_name(target_folder.name + '.warden-partial')
+        try:
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True, exist_ok=True)
+            self._extract_zip(zip_path, staging, item_id)
+            audio_files = [
+                p for p in staging.iterdir()
+                if p.is_file() and p.suffix.lower() in _AUDIO_EXTS
+            ]
+            if not audio_files:
+                log.error(
+                    'inbox: no audio files after extracting item %d, quarantining',
+                    item_id,
+                )
+                shutil.rmtree(staging, ignore_errors=True)
+                self._quarantine(zip_path, reason='no_audio_after_extract')
+                return
+
+            # Move staging into final position. If target already exists
+            # (rare — we checked json_marker above; but bandcampsync may
+            # have written a folder without our JSON marker), merge files
+            # in rather than clobber.
+            target_folder.parent.mkdir(parents=True, exist_ok=True)
+            if target_folder.exists():
+                for src in staging.iterdir():
+                    dst = target_folder / src.name
+                    if dst.exists():
+                        log.warning(
+                            'inbox: skipping overwrite of existing %s', dst
+                        )
+                        src.unlink()
+                    else:
+                        shutil.move(str(src), str(dst))
+                shutil.rmtree(staging, ignore_errors=True)
+            else:
+                staging.rename(target_folder)
+
+            # Write canonical JSON marker (matches MetadataEnricher format).
+            record = self.metadata_enricher._build_record(
+                item_id, target_folder, api_row
+            )
+            self.metadata_enricher._atomic_write(
+                json_marker, json.dumps(record, ensure_ascii=False, indent=2)
+            )
+
+            # Append to ignores.txt so any future bandcampsync run skips
+            # this item. Ignores append is idempotent — duplicate lines
+            # are harmless to bandcampsync.
+            self._append_to_ignores(item_id)
+
+            zip_path.unlink(missing_ok=True)
+            self._processed_count += 1
+            self._last_processed_at = datetime.now(timezone.utc)
+            log.info(
+                'inbox: processed item %d → %s (audio_files=%d)',
+                item_id, target_folder, len(audio_files),
+            )
+        except zipfile.BadZipFile:
+            log.error('inbox: bad ZIP for item %d, quarantining', item_id)
+            shutil.rmtree(staging, ignore_errors=True)
+            self._quarantine(zip_path, reason='bad_zip')
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+    def _extract_zip(
+        self, zip_path: Path, target_folder: Path, item_id: int
+    ) -> None:
+        """Extract files from ZIP into target_folder, flat. Strips a single
+        common root folder if Bandcamp wrapped everything in one. Skips
+        directories. Path traversal attempts (../) are rejected."""
+        with zipfile.ZipFile(zip_path) as zf:
+            names = [n for n in zf.namelist() if not n.endswith('/')]
+            if not names:
+                raise ValueError(f'item {item_id}: zip has no files')
+            root_prefix = _detect_zip_root_prefix(names)
+            for name in names:
+                # Reject anything that tries to escape via .. — zipfile
+                # doesn't sanitize this and a malicious ZIP could write
+                # outside the target.
+                if '..' in Path(name).parts:
+                    log.warning(
+                        'inbox: rejecting traversal entry %s in item %d',
+                        name, item_id,
+                    )
+                    continue
+                if root_prefix and name.startswith(root_prefix):
+                    rel = name[len(root_prefix):]
+                else:
+                    rel = name
+                if not rel:
+                    continue
+                # Flatten — we don't expect subdirs in Bandcamp ZIPs, but
+                # if there are any, take the leaf name.
+                leaf = Path(rel).name
+                if not leaf:
+                    continue
+                dest = target_folder / leaf
+                with zf.open(name) as src, dest.open('wb') as out:
+                    shutil.copyfileobj(src, out, length=64 * 1024)
+
+    def _append_to_ignores(self, item_id: int) -> None:
+        ignores_path = self.config_view / 'ignores.txt'
+        try:
+            with ignores_path.open('a', encoding='utf-8') as f:
+                f.write(f'{item_id}\n')
+        except OSError as e:
+            log.warning(
+                'inbox: could not append item %d to ignores.txt: %s', item_id, e
+            )
+
+    def _quarantine(self, zip_path: Path, reason: str) -> None:
+        try:
+            self.quarantine_path.mkdir(parents=True, exist_ok=True)
+            target = self.quarantine_path / zip_path.name
+            # Don't blow away an existing quarantined copy; suffix instead.
+            counter = 0
+            while target.exists():
+                counter += 1
+                target = self.quarantine_path / (
+                    zip_path.stem + f'.{counter}' + zip_path.suffix
+                )
+            shutil.move(str(zip_path), str(target))
+            self._quarantined_count += 1
+            log.warning(
+                'inbox: quarantined %s (reason=%s) → %s',
+                zip_path.name, reason, target,
+            )
+            asyncio.create_task(
+                self.telegram.send(
+                    f'⚠️ *warden inbox quarantine*\n'
+                    f'`{zip_path.name}`\nreason: `{reason}`'
+                )
+            )
+        except OSError as e:
+            log.error(
+                'inbox: failed to quarantine %s (reason=%s): %s',
+                zip_path.name, reason, e,
+            )
+
+
 # ---------- Orchestrator ----------
 
 class Orchestrator:
@@ -1536,6 +1973,12 @@ enricher = MetadataEnricher(
 orchestrator = Orchestrator(
     state, controller, telegram, Path(settings.config_view_path), settings, enricher,
 )
+inbox_watcher = InboxWatcher(
+    config_view=Path(settings.config_view_path),
+    downloads_view=Path(settings.downloads_view_path),
+    metadata_enricher=enricher,
+    telegram=telegram,
+)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
 
@@ -1590,14 +2033,15 @@ async def lifespan(_: FastAPI):
     _cleanup_orphan_bandcampsync()
     if settings.bandcampsync_patch_enabled:
         _stage_bandcampsync_patch()
-    scheduler.add_job(
-        orchestrator.daily_kickoff,
-        CronTrigger(hour=settings.daily_run_hour, minute=0),
-        id="daily_kickoff",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=3600,
-    )
+    if settings.daily_kickoff_enabled:
+        scheduler.add_job(
+            orchestrator.daily_kickoff,
+            CronTrigger(hour=settings.daily_run_hour, minute=0),
+            id="daily_kickoff",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
     scheduler.add_job(
         orchestrator.check_cookie_expiry,
         CronTrigger(hour=settings.cookie_check_hour, minute=0),
@@ -1607,22 +2051,38 @@ async def lifespan(_: FastAPI):
     )
     scheduler.start()
     log.info(
-        "Sidecar online. Daily kickoff: %02d:00 %s. Ramp quotas: %s. Cookie check: %02d:00.",
-        settings.daily_run_hour, settings.timezone, settings.ramp_quotas,
+        "Sidecar online. Daily kickoff: %s. Ramp quotas: %s. Cookie check: %02d:00. Inbox watcher: %s.",
+        f"{settings.daily_run_hour:02d}:00 {settings.timezone}" if settings.daily_kickoff_enabled else "disabled",
+        settings.ramp_quotas,
         settings.cookie_check_hour,
+        "enabled" if settings.inbox_watcher_enabled else "disabled",
     )
     await telegram.send(
         "🟢 *bandcamp-warden online*\n"
-        f"Daily-Kickoff: `{settings.daily_run_hour:02d}:00 {settings.timezone}`\n"
+        + (
+            f"Daily-Kickoff: `{settings.daily_run_hour:02d}:00 {settings.timezone}`\n"
+            if settings.daily_kickoff_enabled
+            else "Daily-Kickoff: `disabled (Plan E mode)`\n"
+        )
+        + f"Inbox-Watcher: `{'enabled' if settings.inbox_watcher_enabled else 'disabled'}`\n"
         f"Ramp-Quotas: `{settings.ramp_quotas}`"
     )
     # Run a cookie check at startup so the user gets immediate feedback if the
     # cookie file is missing or already near expiry, instead of waiting until
     # tomorrow noon.
     asyncio.create_task(orchestrator.check_cookie_expiry())
+    inbox_task: asyncio.Task | None = None
+    if settings.inbox_watcher_enabled:
+        inbox_task = asyncio.create_task(inbox_watcher.run_loop())
     try:
         yield
     finally:
+        if inbox_task is not None:
+            inbox_watcher.stop()
+            try:
+                await asyncio.wait_for(inbox_task, timeout=10)
+            except asyncio.TimeoutError:
+                inbox_task.cancel()
         scheduler.shutdown(wait=False)
 
 
@@ -2726,3 +3186,90 @@ async def diagnose_fan_api() -> dict:
 
     out.update(await asyncio.to_thread(run))
     return out
+
+
+# ---------- Inbox endpoints (Phase 8b/8c) ----------
+
+
+@app.get("/inbox-status")
+async def inbox_status() -> dict:
+    """Snapshot of the inbox watcher state — pending ZIPs, partial uploads,
+    quarantine, processing counters, last error. LAN-only, no auth."""
+    return inbox_watcher.status()
+
+
+@app.post("/inbox/upload")
+async def inbox_upload(
+    item_id: int,
+    request: Request,
+    x_warden_auth: str = Header(default=""),
+) -> dict:
+    """Accept a streamed ZIP from the Plan-E browser extension and write
+    it directly to <downloads>/_inbox/bandcamp_<item_id>.zip — no SMB
+    round trip from the user's Mac. Auth via shared secret in the
+    X-Warden-Auth header. Body is streamed chunk-by-chunk to a .partial
+    file and atomically renamed on success, so the watcher never reads
+    a half-written ZIP.
+    """
+    expected = settings.inbox_upload_auth_token
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="inbox upload disabled (set WARDEN_INBOX_UPLOAD_AUTH_TOKEN to enable)",
+        )
+    # constant-time compare so a timing attack can't probe the token
+    if not hmac.compare_digest(x_warden_auth, expected):
+        raise HTTPException(status_code=401, detail="bad auth")
+    if item_id <= 0:
+        raise HTTPException(status_code=400, detail="invalid item_id")
+
+    inbox = Path(settings.downloads_view_path) / settings.inbox_subfolder
+    try:
+        inbox.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"inbox mkdir: {e}") from e
+
+    target = inbox / f"bandcamp_{item_id}.zip"
+    partial = inbox / f"bandcamp_{item_id}.zip.partial"
+
+    if target.exists():
+        # Idempotent re-upload: report the existing file's size and bail.
+        # The watcher will pick it up on its next sweep regardless.
+        return {
+            "ok": True,
+            "already_present": True,
+            "size": target.stat().st_size,
+        }
+
+    written = 0
+    max_bytes = settings.inbox_upload_max_bytes
+    try:
+        with partial.open("wb") as f:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"upload exceeds max_bytes={max_bytes}",
+                    )
+                f.write(chunk)
+        if written == 0:
+            raise HTTPException(status_code=400, detail="empty body")
+        os.replace(partial, target)
+    except HTTPException:
+        partial.unlink(missing_ok=True)
+        raise
+    except OSError as e:
+        partial.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"write failed: {e}") from e
+    except Exception as e:
+        partial.unlink(missing_ok=True)
+        log.exception("inbox upload failed for item %d", item_id)
+        raise HTTPException(
+            status_code=500, detail=f"{type(e).__name__}: {e}"
+        ) from e
+
+    log.info("inbox upload: item %d, %d bytes → %s", item_id, written, target)
+    return {"ok": True, "item_id": item_id, "size": written, "path": str(target)}

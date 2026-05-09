@@ -46,6 +46,22 @@ services:
       # --- cookie expiry monitoring ---
       WARDEN_COOKIE_WARN_THRESHOLD_DAYS: "${COOKIE_WARN_THRESHOLD_DAYS:-14}"
 
+      # --- Plan E: extension-driven downloads + sidecar inbox watcher ---
+      # Toggle the inbox watcher loop. When on, the sidecar polls
+      # <downloads>/_inbox/ for ZIPs, looks each item up via the Fan API,
+      # extracts to Artist/Album/, writes bandcamp_<id>.json, appends to
+      # ignores.txt, deletes the ZIP. Default off so existing installs
+      # don't change behavior on upgrade.
+      WARDEN_INBOX_WATCHER_ENABLED: "${INBOX_WATCHER_ENABLED:-false}"
+      # Set to false alongside enabling the watcher to fully stop the
+      # bandcampsync container side. Default true preserves legacy.
+      WARDEN_DAILY_KICKOFF_ENABLED: "${DAILY_KICKOFF_ENABLED:-true}"
+      # Shared secret for POST /inbox/upload. When empty, the endpoint
+      # returns 503 — keeps the install closed by default. Generate a
+      # long random string and put it in .env (and in the extension's
+      # Options page).
+      WARDEN_INBOX_UPLOAD_AUTH_TOKEN: "${INBOX_UPLOAD_AUTH_TOKEN:-}"
+
       TZ: "${TIMEZONE:-Europe/Berlin}"
     volumes:
       # Docker socket — required so the sidecar can spawn/stop bandcampsync.
