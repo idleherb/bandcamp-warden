@@ -193,10 +193,10 @@ async function ensureSidecarPermission(baseUrl: string): Promise<boolean> {
     } catch {
         return true;
     }
-    const has = await browser.permissions.contains({ origins: [origin] });
-    if (has) return true;
-    // permissions.request() must be called from a user-gesture context
-    // (button click), which this is.
+    // CRITICAL: permissions.request must be the FIRST await after the
+    // user gesture. A pre-check via permissions.contains breaks the
+    // gesture chain and the request silently fails. request() is
+    // idempotent — returns true without prompting if already granted.
     return browser.permissions.request({ origins: [origin] });
 }
 

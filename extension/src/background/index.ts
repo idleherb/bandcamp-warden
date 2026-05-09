@@ -203,9 +203,43 @@ async function handleMessage(message: Message): Promise<MessageResponse> {
             case 'test-sidecar': {
                 const cfg = await configStore.get();
                 if (!cfg.sidecarBaseUrl) throw new Error('sidecarBaseUrl is empty');
-                const url = `${cfg.sidecarBaseUrl.replace(/\/+$/, '')}/inbox-status`;
+                const baseTrimmed = cfg.sidecarBaseUrl.replace(/\/+$/, '');
+                const url = `${baseTrimmed}/inbox-status`;
+                let originPattern = '';
+                try {
+                    const u = new URL(baseTrimmed);
+                    originPattern = `${u.protocol}//${u.host}/*`;
+                } catch {
+                    throw new Error(`sidecarBaseUrl is not a valid URL: ${baseTrimmed}`);
+                }
                 const start = performance.now();
-                const res = await fetch(url, { method: 'GET' });
+                let res: Response;
+                try {
+                    res = await fetch(url, { method: 'GET' });
+                } catch (err) {
+                    const durationMs = performance.now() - start;
+                    // TypeError: NetworkError almost always means the host
+                    // permission isn't granted. Check explicitly so the user
+                    // sees a useful message instead of Firefox's stub.
+                    let permissionGranted = false;
+                    try {
+                        permissionGranted = await browser.permissions.contains({
+                            origins: [originPattern],
+                        });
+                    } catch {
+                        // ignore
+                    }
+                    if (!permissionGranted) {
+                        throw new Error(
+                            `fetch ${url} blocked: host permission for ${originPattern} not granted. ` +
+                            `Click Save (with the URL filled in) and accept the Firefox permission prompt.`,
+                        );
+                    }
+                    throw new Error(
+                        `fetch ${url} threw after ${durationMs.toFixed(0)}ms: ${describeError(err)} ` +
+                        `(permission IS granted; check sidecar reachability)`,
+                    );
+                }
                 const durationMs = performance.now() - start;
                 const text = await res.text();
                 let body: unknown = null;
