@@ -15,7 +15,12 @@ export const DEFAULT_CONFIG: Config = {
     sidecarBaseUrl: 'http://homeserver:31080',
     sidecarAuthToken: '',
     inboxSubfolder: '_inbox',
-    maxUploadBytes: 2 * 1024 * 1024 * 1024,
+    // 5 GB covers virtually all real albums including multi-disc lossless
+    // compilations. Items above this are rare; they fail-fast with a link
+    // to the Bandcamp page in the failed-list UI for manual download.
+    // Bumping higher (e.g. 10 GB) is safe on 32GB+ machines — the blob is
+    // only resident during the upload (~tens of seconds on LAN).
+    maxUploadBytes: 5 * 1024 * 1024 * 1024,
 };
 
 export const configStore = makeStore<Config>('config', DEFAULT_CONFIG);

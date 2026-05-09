@@ -119,6 +119,11 @@ class Settings(BaseSettings):
     inbox_poll_seconds: int = 30
     # Quarantine sits inside the inbox so it's visible from the same SMB share.
     inbox_quarantine_subfolder: str = "_inbox/_quarantine"
+    # After this many consecutive failures on the same item, the watcher
+    # quarantines the ZIP instead of looping forever. Catches the case
+    # where ENAMETOOLONG, BadZipFile, or a permanent extraction error
+    # would otherwise spam the log every poll cycle.
+    inbox_max_retries_per_item: int = 3
     # Skip ZIPs newer than this — gives Firefox time to finish writing before
     # we try to read. Cheaper than a size-stability poll and good enough on
     # SMB where stat() can lie about size during in-flight writes.
@@ -958,6 +963,49 @@ class MetadataEnricher:
 _BANDCAMPSYNC_FORBIDDEN = '"#%\'*/?\\`:'
 
 
+# Linux NAME_MAX is 255 bytes for ext4/ZFS. Leave headroom for any
+# downstream suffix (e.g. .partial). Empirically a band/title in the
+# user's library has artist with hundreds of repeated Armenian Յ chars
+# (2 bytes each in UTF-8), which overflows the 255-byte limit and makes
+# the watcher loop on ENAMETOOLONG every 30s.
+_MAX_PATH_COMPONENT_BYTES = 240
+
+
+def _truncate_utf8_safe(s: str, max_bytes: int) -> str:
+    """Truncate a string so its UTF-8 encoding fits in max_bytes, without
+    splitting a multi-byte sequence."""
+    encoded = s.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return s
+    cut = encoded[:max_bytes]
+    # Walk back if we landed inside a multi-byte sequence.
+    while cut:
+        try:
+            return cut.decode("utf-8")
+        except UnicodeDecodeError:
+            cut = cut[:-1]
+    return ""
+
+
+def _truncate_filename(leaf: str) -> str:
+    """Truncate a track filename to NAME_MAX bytes UTF-8 while preserving
+    the file extension. Track titles can be just as long as album titles
+    (the [vertigo collection] case), and the extraction-side OSError
+    is much harder to recover from than the parent-folder case."""
+    encoded = leaf.encode("utf-8")
+    if len(encoded) <= _MAX_PATH_COMPONENT_BYTES:
+        return leaf
+    p = Path(leaf)
+    suffix = p.suffix  # includes the leading '.'
+    stem = p.stem
+    suffix_bytes = len(suffix.encode("utf-8"))
+    if suffix_bytes >= _MAX_PATH_COMPONENT_BYTES:
+        # Pathological — extension alone exceeds the cap. Just hard-truncate.
+        return _truncate_utf8_safe(leaf, _MAX_PATH_COMPONENT_BYTES)
+    available = _MAX_PATH_COMPONENT_BYTES - suffix_bytes
+    return _truncate_utf8_safe(stem, available) + suffix
+
+
 def clean_path_component(name: str) -> str:
     """Filesystem-safe component matching bandcampsync's LocalMedia._clean_path.
 
@@ -984,6 +1032,7 @@ def clean_path_component(name: str) -> str:
     # them. Verified against existing folder "猫 シ Corp." in user's
     # library (/downloads/猫 シ Corp./Blueberries on Mars).
     cleaned = cleaned.strip()
+    cleaned = _truncate_utf8_safe(cleaned, _MAX_PATH_COMPONENT_BYTES).strip()
     return cleaned or '_unknown'
 
 
@@ -1034,6 +1083,10 @@ class InboxWatcher:
         self._quarantined_count = 0
         self._last_processed_at: datetime | None = None
         self._last_error: str | None = None
+        # Per-item retry counter, reset on success/quarantine. Survives
+        # only within a single sidecar process — that's fine, the goal is
+        # to break out of an active loop, not persist failure state.
+        self._retry_counts: dict[int, int] = {}
 
     def status(self) -> dict:
         """Snapshot for /inbox-status endpoint."""
@@ -1161,9 +1214,24 @@ class InboxWatcher:
                 await asyncio.to_thread(
                     self._process_one, item_id, zp, api_row
                 )
+                # Success path: clear retry counter for this item.
+                self._retry_counts.pop(item_id, None)
             except Exception as e:
                 self._last_error = f'item {item_id}: {type(e).__name__}: {e}'
-                log.exception('inbox: processing item %d raised', item_id)
+                attempts = self._retry_counts.get(item_id, 0) + 1
+                self._retry_counts[item_id] = attempts
+                log.error(
+                    'inbox: processing item %d raised (attempt %d/%d): %s: %s',
+                    item_id, attempts, settings.inbox_max_retries_per_item,
+                    type(e).__name__, e,
+                )
+                if attempts >= settings.inbox_max_retries_per_item:
+                    log.warning(
+                        'inbox: item %d exceeded retry limit, quarantining',
+                        item_id,
+                    )
+                    self._quarantine(zp, reason=f'retry_limit:{type(e).__name__}')
+                    self._retry_counts.pop(item_id, None)
 
     async def _ensure_api_cache(self, needed_ids: list[int]) -> None:
         """Refresh the cache if any needed_id is missing or TTL expired."""
@@ -1326,6 +1394,10 @@ class InboxWatcher:
                 leaf = Path(rel).name
                 if not leaf:
                     continue
+                # Track titles inside the ZIP can also exceed NAME_MAX
+                # (the [vertigo collection] case). Truncate while
+                # preserving the extension so audio files stay playable.
+                leaf = _truncate_filename(leaf)
                 dest = target_folder / leaf
                 with zf.open(name) as src, dest.open('wb') as out:
                     shutil.copyfileobj(src, out, length=64 * 1024)

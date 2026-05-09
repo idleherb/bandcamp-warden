@@ -69,20 +69,18 @@ async function uploadViaSidecar(
         `download starting (sidecar-upload): item ${item.id} (${item.bandName} — ${item.itemTitle})`,
     );
 
-    // Streaming pipeline:
-    //   bandcamp fetch (response.body) → byte-counter TransformStream → upload fetch (body)
-    // Neither end materializes the ZIP in RAM — chunks of ~64KB flow
-    // through, and the Sidecar's POST handler streams them straight to
-    // the .partial file. Memory stays roughly constant regardless of item
-    // size, so a 25 GB compilation works the same as a 200 MB album.
+    // We tried streaming via TransformStream + body:ReadableStream + duplex:
+    // 'half'. Result on a 362 MB album: only 23 bytes reached the sidecar.
+    // Firefox MV2 extension-context fetch doesn't honor streaming request
+    // bodies the way the spec implies — sympathetic upstream bug or just
+    // not implemented for our context. So back to buffer-then-upload, with
+    // an explicit Content-Length cap that protects RAM.
     const fetchAbort = new AbortController();
     const fetchTimer = setTimeout(() => fetchAbort.abort(), DOWNLOAD_TIMEOUT_MS);
     const uploadAbort = new AbortController();
     const uploadTimer = setTimeout(() => uploadAbort.abort(), UPLOAD_TIMEOUT_MS);
 
-    let bytesStreamed = 0;
-    let progressTimer: ReturnType<typeof setInterval> | undefined;
-
+    let blob: Blob | null = null;
     try {
         const bandcampResp = await fetch(signedUrl, {
             credentials: 'include',
@@ -93,18 +91,13 @@ async function uploadViaSidecar(
                 `bandcamp fetch ${bandcampResp.status} ${bandcampResp.statusText}`,
             );
         }
-        if (!bandcampResp.body) {
-            throw new Error('bandcamp response has no body — Firefox build too old?');
-        }
-
-        // Pre-read content-length — abort BEFORE we start streaming if the
-        // item exceeds the configured cap. Avoids opening the upload
-        // connection just to tear it down mid-flight.
+        // Pre-read Content-Length — abort BEFORE pulling the body if the
+        // item exceeds the configured cap. Cheap and avoids RAM spikes.
         const claimedLength = parseInt(
             bandcampResp.headers.get('content-length') ?? '0', 10,
         );
         if (claimedLength > 0 && claimedLength > config.maxUploadBytes) {
-            await bandcampResp.body.cancel().catch(() => {});
+            await bandcampResp.body?.cancel().catch(() => {});
             throw new Error(
                 `item too large: content-length=${claimedLength} ` +
                 `(${(claimedLength / (1024 * 1024 * 1024)).toFixed(2)} GB) ` +
@@ -113,53 +106,29 @@ async function uploadViaSidecar(
                 `Raise the limit in Options if you trust this item.`,
             );
         }
-        const totalForLog = claimedLength;
-        void log.info(
-            `streaming item ${item.id}: total=${totalForLog > 0 ? `${totalForLog} bytes` : 'unknown'}`,
-        );
+        // Buffered read with progress logging + a streaming hard-cap so a
+        // missing/lying Content-Length can't blow past the configured limit.
+        blob = await readWithProgress(bandcampResp, item.id, config.maxUploadBytes);
+    } finally {
+        clearTimeout(fetchTimer);
+    }
 
-        // Byte-counting passthrough. Also enforces the cap mid-stream
-        // for cases where Content-Length lied or was missing.
-        const limit = config.maxUploadBytes;
-        const counter = new TransformStream<Uint8Array, Uint8Array>({
-            transform(chunk, controller) {
-                bytesStreamed += chunk.byteLength;
-                if (bytesStreamed > limit) {
-                    controller.error(
-                        new Error(
-                            `stream exceeded maxUploadBytes=${limit} mid-download ` +
-                            `(received ${bytesStreamed}); aborted`,
-                        ),
-                    );
-                    return;
-                }
-                controller.enqueue(chunk);
-            },
-        });
-        const piped = bandcampResp.body.pipeThrough(counter);
+    const bytes = blob.size;
+    if (bytes === 0) {
+        blob = null;
+        throw new Error('bandcamp fetch returned 0 bytes');
+    }
 
-        progressTimer = setInterval(() => {
-            const mb = (bytesStreamed / (1024 * 1024)).toFixed(1);
-            const pct = totalForLog > 0
-                ? ` (${((bytesStreamed / totalForLog) * 100).toFixed(1)}%)`
-                : '';
-            void log.info(`streaming item ${item.id}: ${mb} MB${pct}`);
-        }, PROGRESS_LOG_INTERVAL_MS);
-
-        // duplex: 'half' is required for streaming request bodies in
-        // fetch. Standard TS DOM types haven't caught up to the spec
-        // yet, so we cast.
+    try {
         const upResp = await fetch(uploadUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/zip',
                 'X-Warden-Auth': config.sidecarAuthToken,
             },
-            body: piped,
+            body: blob,
             signal: uploadAbort.signal,
-            duplex: 'half',
-        } as RequestInit & { duplex: 'half' });
-
+        });
         // Drain response body — keeps Firefox from holding the connection.
         const respText = await upResp.text();
         if (!upResp.ok) {
@@ -168,18 +137,69 @@ async function uploadViaSidecar(
             );
         }
         void log.info(
-            `download done (sidecar-upload): item ${item.id}, ${bytesStreamed} bytes`,
+            `download done (sidecar-upload): item ${item.id}, ${bytes} bytes`,
         );
         return {
             transport: 'sidecar-upload',
-            bytes: bytesStreamed,
+            bytes,
             targetHint: `${config.sidecarBaseUrl}/inbox/${item.id}`,
         };
     } finally {
-        clearTimeout(fetchTimer);
         clearTimeout(uploadTimer);
-        if (progressTimer !== undefined) clearInterval(progressTimer);
+        // Drop the only strong reference so GC can reclaim the ZIP bytes
+        // immediately, regardless of whether the upload threw.
+        blob = null;
     }
+}
+
+async function readWithProgress(
+    response: Response,
+    itemId: number,
+    maxBytes: number,
+): Promise<Blob> {
+    if (!response.body) {
+        return response.blob();
+    }
+    const totalRaw = response.headers.get('content-length');
+    const total = totalRaw ? parseInt(totalRaw, 10) : 0;
+    const contentType = response.headers.get('content-type') ?? 'application/zip';
+    const reader = response.body.getReader();
+    const chunks: BlobPart[] = [];
+    let received = 0;
+    let lastLogAt = performance.now();
+    void log.info(
+        `fetching item ${itemId}: total=${total > 0 ? `${total} bytes` : 'unknown'}`,
+    );
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+            received += value.byteLength;
+            if (received > maxBytes) {
+                await reader.cancel().catch(() => {});
+                throw new Error(
+                    `item ${itemId}: stream exceeded maxUploadBytes=${maxBytes} ` +
+                    `mid-download (received ${received}); aborted to protect RAM`,
+                );
+            }
+            chunks.push(value as BlobPart);
+            const now = performance.now();
+            if (now - lastLogAt >= PROGRESS_LOG_INTERVAL_MS) {
+                const pct = total > 0 ? ` (${((received / total) * 100).toFixed(1)}%)` : '';
+                const mb = (received / (1024 * 1024)).toFixed(1);
+                void log.info(`fetching item ${itemId}: ${mb} MB received${pct}`);
+                lastLogAt = now;
+            }
+        }
+    } finally {
+        try {
+            reader.releaseLock();
+        } catch {
+            // ignore — reader may already be released after cancel
+        }
+    }
+    return new Blob(chunks, { type: contentType });
 }
 
 function buildUploadUrl(baseUrl: string, itemId: number): string {
