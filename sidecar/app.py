@@ -124,6 +124,13 @@ class Settings(BaseSettings):
     # where ENAMETOOLONG, BadZipFile, or a permanent extraction error
     # would otherwise spam the log every poll cycle.
     inbox_max_retries_per_item: int = 3
+
+    # Daily Telegram progress summary (Plan-E mode). When enabled, fires
+    # once per day at this hour (Europe/Berlin per timezone setting) and
+    # additionally on every sidecar startup so a Watchtower-driven
+    # restart doesn't leave the user without status until 22:00.
+    daily_summary_enabled: bool = True
+    daily_summary_hour: int = 22
     # Skip ZIPs newer than this — gives Firefox time to finish writing before
     # we try to read. Cheaper than a size-stability poll and good enough on
     # SMB where stat() can lie about size during in-flight writes.
@@ -1087,6 +1094,10 @@ class InboxWatcher:
         # only within a single sidecar process — that's fine, the goal is
         # to break out of an active loop, not persist failure state.
         self._retry_counts: dict[int, int] = {}
+        # Captured at run_loop() start so _quarantine() can fire telegram
+        # notifications from the worker thread (where there's no running
+        # loop and asyncio.create_task would raise RuntimeError).
+        self._main_loop: asyncio.AbstractEventLoop | None = None
 
     def status(self) -> dict:
         """Snapshot for /inbox-status endpoint."""
@@ -1134,6 +1145,9 @@ class InboxWatcher:
         a transient hiccup (e.g. SMB blip on the dataset) doesn't kill
         the loop. Slowing or speeding the cadence happens via the
         inbox_poll_seconds setting; default 30s."""
+        # Capture the main event loop so worker threads can dispatch
+        # async work (telegram sends from _quarantine()) safely.
+        self._main_loop = asyncio.get_running_loop()
         log.info('inbox watcher starting (path=%s)', self.inbox_path)
         try:
             self.inbox_path.mkdir(parents=True, exist_ok=True)
@@ -1429,17 +1443,230 @@ class InboxWatcher:
                 'inbox: quarantined %s (reason=%s) → %s',
                 zip_path.name, reason, target,
             )
-            asyncio.create_task(
-                self.telegram.send(
-                    f'⚠️ *warden inbox quarantine*\n'
-                    f'`{zip_path.name}`\nreason: `{reason}`'
-                )
+            self._fire_telegram(
+                f'⚠️ *warden inbox quarantine*\n'
+                f'`{zip_path.name}`\nreason: `{reason}`'
             )
         except OSError as e:
             log.error(
                 'inbox: failed to quarantine %s (reason=%s): %s',
                 zip_path.name, reason, e,
             )
+
+    def _fire_telegram(self, message: str) -> None:
+        """Schedule a telegram send from either an async or worker-thread
+        context. asyncio.create_task only works on the running loop, so
+        from a thread we use run_coroutine_threadsafe against the captured
+        main loop. Either way, errors are swallowed — telegram failures
+        must not break the watcher."""
+        coro = self.telegram.send(message)
+        try:
+            asyncio.get_running_loop()
+            asyncio.create_task(coro)
+            return
+        except RuntimeError:
+            pass
+        loop = self._main_loop
+        if loop is not None and not loop.is_closed():
+            try:
+                asyncio.run_coroutine_threadsafe(coro, loop)
+                return
+            except RuntimeError:
+                pass
+        log.warning('telegram notification dropped (no event loop available)')
+
+
+# ---------- Progress tracker (Plan-E daily summary) ----------
+
+
+class ProgressTracker:
+    """Counts what's on disk, tracks daily deltas via JSON snapshots in
+    /state, and turns the result into the daily Telegram summary.
+    Source-of-truth is always the filesystem (bandcamp_<id>.json markers
+    + _quarantine/*.zip), so a SQLite/state corruption can't lie about
+    progress — only ETA continuity is lost."""
+
+    _MARKER_RE = re.compile(r'^bandcamp_(\d+)\.json$')
+
+    def __init__(
+        self,
+        state_path: Path,
+        downloads_view: Path,
+        quarantine_path: Path,
+        enricher: MetadataEnricher,
+        telegram: Telegram,
+    ) -> None:
+        self.state_path = state_path
+        self.downloads_view = downloads_view
+        self.quarantine_path = quarantine_path
+        self.enricher = enricher
+        self.telegram = telegram
+        self._snap_path = state_path / 'warden_progress.json'
+
+    # ---- file-system counts ----
+
+    def count_completed(self) -> int:
+        if not self.downloads_view.exists():
+            return 0
+        cnt = 0
+        for p in self.downloads_view.rglob('bandcamp_*.json'):
+            if self._MARKER_RE.match(p.name):
+                cnt += 1
+        return cnt
+
+    def count_quarantined(self) -> int:
+        if not self.quarantine_path.exists():
+            return 0
+        return sum(
+            1 for p in self.quarantine_path.glob('bandcamp_*.zip') if p.is_file()
+        )
+
+    async def get_collection_total(self) -> int | None:
+        """Hit Fan API to learn how many items the user owns. Returns None
+        on auth/network failure so callers can show '?' rather than 0."""
+        try:
+            api_map = await asyncio.to_thread(
+                self.enricher._fetch_collection_sync, 0, {}
+            )
+            return len(api_map) if api_map else None
+        except Exception:
+            log.exception('progress: Fan API total fetch failed')
+            return None
+
+    # ---- snapshots ----
+
+    def _load_snapshots(self) -> dict:
+        if not self._snap_path.exists():
+            return {'first_run_at': None, 'snapshots': []}
+        try:
+            return json.loads(self._snap_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning('progress: failed to load %s: %s', self._snap_path, e)
+            return {'first_run_at': None, 'snapshots': []}
+
+    def _save_snapshots(self, data: dict) -> None:
+        try:
+            self.state_path.mkdir(parents=True, exist_ok=True)
+            tmp = self._snap_path.with_suffix('.json.tmp')
+            tmp.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding='utf-8',
+            )
+            os.replace(tmp, self._snap_path)
+        except OSError as e:
+            log.warning('progress: failed to save %s: %s', self._snap_path, e)
+
+    # ---- summary ----
+
+    async def compute_summary(self, persist: bool = True) -> dict:
+        data = self._load_snapshots()
+        now = datetime.now(timezone.utc)
+        if data.get('first_run_at') is None:
+            data['first_run_at'] = now.isoformat()
+        first_run = datetime.fromisoformat(data['first_run_at'])
+        days_running = max(1, (now - first_run).days + 1)
+
+        completed = self.count_completed()
+        quarantined = self.count_quarantined()
+        total = await self.get_collection_total()
+
+        snapshots = data.get('snapshots') or []
+        # Today-delta: snapshot from ~24h ago. If none (fresh install),
+        # treat as 0 — first day's "today" count is meaningless.
+        ref_24h = None
+        cutoff_24h = now.timestamp() - 24 * 3600
+        for s in reversed(snapshots):
+            try:
+                ts = datetime.fromisoformat(s['ts']).timestamp()
+            except (KeyError, ValueError):
+                continue
+            if ts <= cutoff_24h:
+                ref_24h = s
+                break
+        if ref_24h is not None:
+            today_completed = max(0, completed - int(ref_24h.get('completed', 0)))
+            today_quarantined = max(
+                0, quarantined - int(ref_24h.get('quarantined', 0)),
+            )
+        else:
+            today_completed = 0
+            today_quarantined = 0
+
+        # ETA: rolling rate over last ~7 days of snapshots.
+        eta_days: int | None = None
+        if total is not None and total > completed:
+            remaining = total - completed
+            recent = []
+            cutoff_7d = now.timestamp() - 7 * 24 * 3600
+            for s in snapshots:
+                try:
+                    ts = datetime.fromisoformat(s['ts']).timestamp()
+                except (KeyError, ValueError):
+                    continue
+                if ts >= cutoff_7d:
+                    recent.append((ts, int(s.get('completed', 0))))
+            if len(recent) >= 2:
+                recent.sort()
+                t_old, c_old = recent[0]
+                t_new, c_new = recent[-1]
+                span_days = (t_new - t_old) / 86400
+                gain = c_new - c_old
+                if span_days > 0 and gain > 0:
+                    rate = gain / span_days
+                    eta_days = int(remaining / rate + 0.5)
+            elif today_completed > 0:
+                eta_days = int(remaining / today_completed + 0.5)
+
+        if persist:
+            snapshots.append({
+                'ts': now.isoformat(),
+                'completed': completed,
+                'quarantined': quarantined,
+            })
+            # Keep last 30 days; older snapshots aren't useful and grow the file.
+            cutoff_30d = now.timestamp() - 30 * 24 * 3600
+            snapshots = [
+                s for s in snapshots
+                if datetime.fromisoformat(s['ts']).timestamp() >= cutoff_30d
+            ]
+            data['snapshots'] = snapshots
+            self._save_snapshots(data)
+
+        return {
+            'days_running': days_running,
+            'completed': completed,
+            'total': total,
+            'quarantined': quarantined,
+            'today_completed': today_completed,
+            'today_quarantined': today_quarantined,
+            'eta_days': eta_days,
+            'first_run_at': data['first_run_at'],
+        }
+
+    @staticmethod
+    def format_for_telegram(s: dict) -> str:
+        lines = ["📊 *bandcamp-warden daily report*", ""]
+        lines.append(f"Tage gelaufen: `{s['days_running']}`")
+        if s.get('total'):
+            lines.append(
+                f"Bisher heruntergeladen: `{s['completed']}/{s['total']}`",
+            )
+        else:
+            lines.append(f"Bisher heruntergeladen: `{s['completed']}`")
+        lines.append(f"Bisher gescheitert: `{s['quarantined']}`")
+        lines.append(f"Heute heruntergeladen: `{s['today_completed']}`")
+        lines.append(f"Heute gescheitert: `{s['today_quarantined']}`")
+        eta = s.get('eta_days')
+        if eta is not None and eta > 0:
+            lines.append(f"Voraussichtlich fertig in: `~{eta}` Tagen")
+        else:
+            lines.append("Voraussichtlich fertig in: `?`")
+        return "\n".join(lines)
+
+    async def send_daily_report(self) -> dict:
+        s = await self.compute_summary(persist=True)
+        await self.telegram.send(self.format_for_telegram(s))
+        return s
 
 
 # ---------- Orchestrator ----------
@@ -2073,6 +2300,13 @@ inbox_watcher = InboxWatcher(
     metadata_enricher=enricher,
     telegram=telegram,
 )
+progress_tracker = ProgressTracker(
+    state_path=Path(settings.state_path),
+    downloads_view=Path(settings.downloads_view_path),
+    quarantine_path=Path(settings.downloads_view_path) / settings.inbox_quarantine_subfolder,
+    enricher=enricher,
+    telegram=telegram,
+)
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 
 
@@ -2143,6 +2377,15 @@ async def lifespan(_: FastAPI):
         max_instances=1,
         coalesce=True,
     )
+    if settings.daily_summary_enabled:
+        scheduler.add_job(
+            progress_tracker.send_daily_report,
+            CronTrigger(hour=settings.daily_summary_hour, minute=0),
+            id="daily_summary",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
     scheduler.start()
     log.info(
         "Sidecar online. Daily kickoff: %s. Ramp quotas: %s. Cookie check: %02d:00. Inbox watcher: %s.",
@@ -2151,16 +2394,20 @@ async def lifespan(_: FastAPI):
         settings.cookie_check_hour,
         "enabled" if settings.inbox_watcher_enabled else "disabled",
     )
-    await telegram.send(
-        "🟢 *bandcamp-warden online*\n"
-        + (
-            f"Daily-Kickoff: `{settings.daily_run_hour:02d}:00 {settings.timezone}`\n"
-            if settings.daily_kickoff_enabled
-            else "Daily-Kickoff: `disabled (Plan E mode)`\n"
-        )
-        + f"Inbox-Watcher: `{'enabled' if settings.inbox_watcher_enabled else 'disabled'}`\n"
-        f"Ramp-Quotas: `{settings.ramp_quotas}`"
-    )
+    # Plan-E mode: send the daily report at startup (so a Watchtower
+    # restart doesn't leave the user without status until the cron
+    # fires), instead of the noisy banner with kickoff/watcher/ramp
+    # info that's no-op in this mode anyway.
+    if settings.inbox_watcher_enabled and settings.daily_summary_enabled:
+        async def _startup_report() -> None:
+            try:
+                await progress_tracker.send_daily_report()
+            except Exception:
+                log.exception("startup daily report failed")
+                await telegram.send("🟢 *bandcamp-warden online*")
+        asyncio.create_task(_startup_report())
+    else:
+        await telegram.send("🟢 *bandcamp-warden online*")
     # Run a cookie check at startup so the user gets immediate feedback if the
     # cookie file is missing or already near expiry, instead of waiting until
     # tomorrow noon.
@@ -3307,6 +3554,15 @@ async def inbox_status() -> dict:
     """Snapshot of the inbox watcher state — pending ZIPs, partial uploads,
     quarantine, processing counters, last error. LAN-only, no auth."""
     return inbox_watcher.status()
+
+
+@app.get("/daily-summary")
+async def daily_summary_endpoint(send: bool = False) -> dict:
+    """Compute the daily summary right now. ?send=true also pushes it to
+    Telegram (useful for manual checks without waiting for the 22:00 cron)."""
+    if send:
+        return await progress_tracker.send_daily_report()
+    return await progress_tracker.compute_summary(persist=False)
 
 
 @app.get("/list-completed-ids")
