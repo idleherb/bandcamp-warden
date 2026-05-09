@@ -46,16 +46,27 @@ export async function markCompleted(itemId: number): Promise<void> {
     });
 }
 
-export async function markFailed(itemId: number, error: string): Promise<void> {
+export async function markFailed(
+    item: QueueItem,
+    error: string,
+): Promise<void> {
     const config = await configStore.get();
     let attempts = 1;
     await failedStore.update((f) => {
-        const existing = f.find((x) => x.id === itemId);
+        const existing = f.find((x) => x.id === item.id);
         attempts = (existing?.attempts ?? 0) + 1;
-        const filtered = f.filter((x) => x.id !== itemId);
+        const filtered = f.filter((x) => x.id !== item.id);
         return [
             ...filtered,
-            { id: itemId, error, lastTryAt: new Date().toISOString(), attempts },
+            {
+                id: item.id,
+                error,
+                lastTryAt: new Date().toISOString(),
+                attempts,
+                bandName: item.bandName,
+                itemTitle: item.itemTitle,
+                itemUrl: item.itemUrl,
+            },
         ];
     });
     await stateStore.update((raw) => {
@@ -76,7 +87,7 @@ export async function markFailed(itemId: number, error: string): Promise<void> {
             pausedUntil: breaker.pausedUntil,
         };
     });
-    void log.error(`item ${itemId} failed (attempt ${attempts}): ${error}`);
+    void log.error(`item ${item.id} failed (attempt ${attempts}): ${error}`);
 }
 
 export async function requeueItemHead(item: QueueItem, transientPauseSec: number): Promise<void> {

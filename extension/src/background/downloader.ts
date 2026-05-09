@@ -69,96 +69,116 @@ async function uploadViaSidecar(
         `download starting (sidecar-upload): item ${item.id} (${item.bandName} — ${item.itemTitle})`,
     );
 
-    // Memory discipline:
-    //   - blob materializes the full ZIP in extension memory exactly once.
-    //   - try/finally nulls the reference so GC can reclaim even on error.
-    //   - upload Response body is drained explicitly (await arrayBuffer)
-    //     so Firefox releases its internal connection buffers.
-    //   - One item at a time is enforced upstream by the inFlight gate, so
-    //     we never have two of these blobs in RAM concurrently.
-    let blob: Blob | null = null;
+    // Streaming pipeline:
+    //   bandcamp fetch (response.body) → byte-counter TransformStream → upload fetch (body)
+    // Neither end materializes the ZIP in RAM — chunks of ~64KB flow
+    // through, and the Sidecar's POST handler streams them straight to
+    // the .partial file. Memory stays roughly constant regardless of item
+    // size, so a 25 GB compilation works the same as a 200 MB album.
     const fetchAbort = new AbortController();
     const fetchTimer = setTimeout(() => fetchAbort.abort(), DOWNLOAD_TIMEOUT_MS);
+    const uploadAbort = new AbortController();
+    const uploadTimer = setTimeout(() => uploadAbort.abort(), UPLOAD_TIMEOUT_MS);
+
+    let bytesStreamed = 0;
+    let progressTimer: ReturnType<typeof setInterval> | undefined;
+
     try {
         const bandcampResp = await fetch(signedUrl, {
             credentials: 'include',
             signal: fetchAbort.signal,
         });
         if (!bandcampResp.ok) {
-            throw new Error(`bandcamp fetch ${bandcampResp.status} ${bandcampResp.statusText}`);
+            throw new Error(
+                `bandcamp fetch ${bandcampResp.status} ${bandcampResp.statusText}`,
+            );
         }
-        // Bail BEFORE reading the body for items above the size cap —
-        // otherwise a 25 GB compilation lands as a Blob in extension RAM
-        // and either OOM-kills Firefox or grinds it to a halt. Content-
-        // Length is reliable for Bandcamp's CDN responses.
+        if (!bandcampResp.body) {
+            throw new Error('bandcamp response has no body — Firefox build too old?');
+        }
+
+        // Pre-read content-length — abort BEFORE we start streaming if the
+        // item exceeds the configured cap. Avoids opening the upload
+        // connection just to tear it down mid-flight.
         const claimedLength = parseInt(
             bandcampResp.headers.get('content-length') ?? '0', 10,
         );
         if (claimedLength > 0 && claimedLength > config.maxUploadBytes) {
-            // Drain the body so the connection closes cleanly — never
-            // actually read into a Blob. cancel() releases the response.
-            await bandcampResp.body?.cancel().catch(() => {});
+            await bandcampResp.body.cancel().catch(() => {});
             throw new Error(
-                `item too large for sidecar-upload: content-length=${claimedLength} ` +
-                `(${(claimedLength / (1024 * 1024 * 1024)).toFixed(1)} GB) ` +
+                `item too large: content-length=${claimedLength} ` +
+                `(${(claimedLength / (1024 * 1024 * 1024)).toFixed(2)} GB) ` +
                 `exceeds maxUploadBytes=${config.maxUploadBytes} ` +
-                `(${(config.maxUploadBytes / (1024 * 1024 * 1024)).toFixed(1)} GB). ` +
-                `Raise the limit in Options if your machine has the RAM, or use ` +
-                `browser-download transport for this one.`,
+                `(${(config.maxUploadBytes / (1024 * 1024 * 1024)).toFixed(2)} GB). ` +
+                `Raise the limit in Options if you trust this item.`,
             );
         }
-        // Read body via ReadableStream so we can log progress every few
-        // seconds — without this, a stalled CDN connection looks identical
-        // to a working slow download for many minutes. Memory cost is the
-        // same as response.blob() since chunks are held until Blob is built.
-        blob = await readWithProgress(bandcampResp, item.id, config.maxUploadBytes);
-    } finally {
-        clearTimeout(fetchTimer);
-    }
-
-    const bytes = blob.size;
-    if (bytes === 0) {
-        blob = null;
-        throw new Error('bandcamp fetch returned 0 bytes');
-    }
-    if (bytes > config.maxUploadBytes) {
-        blob = null;
-        throw new Error(
-            `bandcamp ZIP is ${bytes} bytes, exceeds maxUploadBytes=${config.maxUploadBytes}`,
+        const totalForLog = claimedLength;
+        void log.info(
+            `streaming item ${item.id}: total=${totalForLog > 0 ? `${totalForLog} bytes` : 'unknown'}`,
         );
-    }
 
-    const uploadAbort = new AbortController();
-    const uploadTimer = setTimeout(() => uploadAbort.abort(), UPLOAD_TIMEOUT_MS);
-    try {
+        // Byte-counting passthrough. Also enforces the cap mid-stream
+        // for cases where Content-Length lied or was missing.
+        const limit = config.maxUploadBytes;
+        const counter = new TransformStream<Uint8Array, Uint8Array>({
+            transform(chunk, controller) {
+                bytesStreamed += chunk.byteLength;
+                if (bytesStreamed > limit) {
+                    controller.error(
+                        new Error(
+                            `stream exceeded maxUploadBytes=${limit} mid-download ` +
+                            `(received ${bytesStreamed}); aborted`,
+                        ),
+                    );
+                    return;
+                }
+                controller.enqueue(chunk);
+            },
+        });
+        const piped = bandcampResp.body.pipeThrough(counter);
+
+        progressTimer = setInterval(() => {
+            const mb = (bytesStreamed / (1024 * 1024)).toFixed(1);
+            const pct = totalForLog > 0
+                ? ` (${((bytesStreamed / totalForLog) * 100).toFixed(1)}%)`
+                : '';
+            void log.info(`streaming item ${item.id}: ${mb} MB${pct}`);
+        }, PROGRESS_LOG_INTERVAL_MS);
+
+        // duplex: 'half' is required for streaming request bodies in
+        // fetch. Standard TS DOM types haven't caught up to the spec
+        // yet, so we cast.
         const upResp = await fetch(uploadUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/zip',
                 'X-Warden-Auth': config.sidecarAuthToken,
             },
-            body: blob,
+            body: piped,
             signal: uploadAbort.signal,
-        });
-        // Drain the response body even if we don't use it — leaving an
-        // unclosed body keeps Firefox holding onto the connection.
+            duplex: 'half',
+        } as RequestInit & { duplex: 'half' });
+
+        // Drain response body — keeps Firefox from holding the connection.
         const respText = await upResp.text();
         if (!upResp.ok) {
-            throw new Error(`sidecar upload ${upResp.status}: ${respText.slice(0, 200)}`);
+            throw new Error(
+                `sidecar upload ${upResp.status}: ${respText.slice(0, 200)}`,
+            );
         }
         void log.info(
-            `download done (sidecar-upload): item ${item.id}, ${bytes} bytes`,
+            `download done (sidecar-upload): item ${item.id}, ${bytesStreamed} bytes`,
         );
         return {
             transport: 'sidecar-upload',
-            bytes,
+            bytes: bytesStreamed,
             targetHint: `${config.sidecarBaseUrl}/inbox/${item.id}`,
         };
     } finally {
+        clearTimeout(fetchTimer);
         clearTimeout(uploadTimer);
-        // Drop the only strong reference we hold so GC can reclaim the
-        // ZIP bytes immediately, regardless of whether the upload threw.
-        blob = null;
+        if (progressTimer !== undefined) clearInterval(progressTimer);
     }
 }
 
@@ -168,67 +188,6 @@ function buildUploadUrl(baseUrl: string, itemId: number): string {
 }
 
 const PROGRESS_LOG_INTERVAL_MS = 5000;
-
-async function readWithProgress(
-    response: Response,
-    itemId: number,
-    maxBytes: number,
-): Promise<Blob> {
-    if (!response.body) {
-        // Some Firefox builds don't expose body on a Response; fall back to
-        // .blob() and lose progress visibility for that one download.
-        return response.blob();
-    }
-    const totalRaw = response.headers.get('content-length');
-    const total = totalRaw ? parseInt(totalRaw, 10) : 0;
-    const contentType = response.headers.get('content-type') ?? 'application/zip';
-    const reader = response.body.getReader();
-    // BlobPart[] rather than Uint8Array[] — TS narrows Uint8Array's
-    // backing buffer to ArrayBuffer | SharedArrayBuffer, and Blob's
-    // constructor signature only accepts ArrayBuffer-backed parts.
-    // BlobPart is the declared type for the constructor's array.
-    const chunks: BlobPart[] = [];
-    let received = 0;
-    let lastLogAt = performance.now();
-    void log.info(
-        `fetching item ${itemId}: total=${total > 0 ? `${total} bytes` : 'unknown'}`,
-    );
-    try {
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!value) continue;
-            received += value.byteLength;
-            // Backstop in case Content-Length lied or was missing — bail
-            // before chunks pile up past the configured cap. The early
-            // pre-read content-length check upstream catches the common
-            // case; this catches chunked-encoding and missing-header
-            // edge cases.
-            if (received > maxBytes) {
-                await reader.cancel().catch(() => {});
-                throw new Error(
-                    `item ${itemId}: stream exceeded maxUploadBytes=${maxBytes} ` +
-                    `mid-download (received ${received}); aborted to protect RAM`,
-                );
-            }
-            chunks.push(value as BlobPart);
-            const now = performance.now();
-            if (now - lastLogAt >= PROGRESS_LOG_INTERVAL_MS) {
-                const pct = total > 0 ? ` (${((received / total) * 100).toFixed(1)}%)` : '';
-                const mb = (received / (1024 * 1024)).toFixed(1);
-                void log.info(`fetching item ${itemId}: ${mb} MB received${pct}`);
-                lastLogAt = now;
-            }
-        }
-    } finally {
-        try {
-            reader.releaseLock();
-        } catch {
-            // ignore — reader may already be released on cancel
-        }
-    }
-    return new Blob(chunks, { type: contentType });
-}
 
 // ---------- Path B: browser.downloads.download (SMB / local) ----------
 

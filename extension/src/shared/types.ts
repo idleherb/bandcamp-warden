@@ -19,6 +19,9 @@ export interface FailedItem {
     error: string;
     lastTryAt: string;
     attempts: number;
+    bandName?: string;
+    itemTitle?: string;
+    itemUrl?: string;
 }
 
 export type DownloadFormat =

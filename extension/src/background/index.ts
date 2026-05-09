@@ -173,7 +173,7 @@ async function processOneTick(force = false): Promise<TickResult> {
             );
             return { run: false, reason: `transient (${err.code}), requeued` };
         }
-        await markFailed(item.id, describeError(err));
+        await markFailed(item, describeError(err));
         return { run: false, reason: `failed: ${describeError(err)}` };
     }
 }

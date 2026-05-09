@@ -123,8 +123,61 @@ async function renderLog(): Promise<void> {
     );
 }
 
+async function renderFailed(): Promise<void> {
+    const list = document.getElementById('failed-list');
+    const countEl = document.getElementById('failed-count');
+    if (!list) return;
+    const failed = await failedStore.get();
+    if (countEl) countEl.textContent = `(${failed.length})`;
+    if (failed.length === 0) {
+        list.replaceChildren();
+        return;
+    }
+    // Newest-failed first.
+    const sorted = [...failed].sort((a, b) =>
+        b.lastTryAt.localeCompare(a.lastTryAt),
+    );
+    list.replaceChildren(
+        ...sorted.map((f) => {
+            const li = document.createElement('li');
+            li.className = 'failed-entry';
+
+            const title = document.createElement('div');
+            title.className = 'failed-title';
+            const label = `${f.bandName ?? '?'} — ${f.itemTitle ?? '?'} (id=${f.id})`;
+            if (f.itemUrl) {
+                const a = document.createElement('a');
+                a.href = f.itemUrl;
+                a.target = '_blank';
+                a.rel = 'noopener noreferrer';
+                a.textContent = label;
+                title.append(a);
+            } else {
+                title.textContent = label;
+            }
+
+            const meta = document.createElement('div');
+            meta.className = 'failed-meta';
+            meta.textContent = `${f.lastTryAt} · attempts=${f.attempts}`;
+
+            const err = document.createElement('div');
+            err.className = 'failed-error';
+            err.textContent = f.error;
+
+            li.append(title, meta, err);
+            return li;
+        }),
+    );
+}
+
 async function refreshAll(): Promise<void> {
-    await Promise.all([renderConfigForm(), renderState(), renderQueue(), renderLog()]);
+    await Promise.all([
+        renderConfigForm(),
+        renderState(),
+        renderQueue(),
+        renderFailed(),
+        renderLog(),
+    ]);
 }
 
 function setResult(elId: string, text: string, isError = false): void {
