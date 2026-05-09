@@ -36,6 +36,7 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -2087,6 +2088,23 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="bandcamp-warden", lifespan=lifespan)
+
+# CORS for the Plan-E browser extension. Firefox enforces CORS on
+# extension background-script fetches when the destination origin was
+# granted via runtime-requested optional_permissions (as opposed to
+# manifest's mandatory permissions). The sidecar is auth-protected via
+# the X-Warden-Auth header — credentials/cookies aren't part of the
+# auth model — so allow_origins=["*"] is safe here. Don't enable
+# allow_credentials: that would couple CORS to cookies and require a
+# concrete origin allowlist instead of "*".
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
+)
 
 
 @app.get("/healthz")
