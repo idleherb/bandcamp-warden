@@ -9,9 +9,11 @@ import type {
     ResolveFirstUrlResult,
     SaveConfigResult,
     SetEnabledResult,
+    SyncCompletedResult,
     TestSidecarResult,
 } from '../shared/messages.js';
 import { completedStore, queueStore, stateStore } from '../shared/storage.js';
+import type { Config } from '../shared/types.js';
 import {
     fetchHomepageContext,
     paginateCollection,
@@ -46,6 +48,12 @@ browser.runtime.onStartup.addListener(async () => {
 browser.browserAction.onClicked.addListener(() => {
     void browser.runtime.openOptionsPage();
 });
+
+function sidecarUrlOrThrow(cfg: Config, path: string): string {
+    if (!cfg.sidecarBaseUrl) throw new Error('sidecarBaseUrl is empty (set it in Options)');
+    const trimmed = cfg.sidecarBaseUrl.replace(/\/+$/, '');
+    return `${trimmed}${path.startsWith('/') ? path : `/${path}`}`;
+}
 
 function describeError(err: unknown): string {
     if (err instanceof Error) return `${err.name}: ${err.message}`;
@@ -198,6 +206,50 @@ async function handleMessage(message: Message): Promise<MessageResponse> {
                     `config saved (transport=${next.transport}, sidecar=${next.sidecarBaseUrl})`,
                 );
                 const data: SaveConfigResult = { config: next };
+                return { ok: true, data };
+            }
+            case 'sync-completed-from-sidecar': {
+                const cfg = await configStore.get();
+                const url = sidecarUrlOrThrow(cfg, '/list-completed-ids');
+                await log.info('sync-completed-from-sidecar requested');
+                const res = await fetch(url, { method: 'GET' });
+                if (!res.ok) {
+                    throw new Error(
+                        `${url} returned HTTP ${res.status} ${res.statusText}`,
+                    );
+                }
+                const json = (await res.json()) as {
+                    completed_ids?: number[];
+                    count?: number;
+                    scanned_folder?: string;
+                };
+                const incoming = Array.isArray(json.completed_ids) ? json.completed_ids : [];
+                let addedToCompleted = 0;
+                const next = await completedStore.update((cur) => {
+                    const have = new Set(cur);
+                    const merged = [...cur];
+                    for (const id of incoming) {
+                        if (!have.has(id)) {
+                            have.add(id);
+                            merged.push(id);
+                            addedToCompleted++;
+                        }
+                    }
+                    return merged;
+                });
+                await log.info(
+                    `sync-completed: sidecar reported ${incoming.length}, ` +
+                    `added ${addedToCompleted} new, completed-set is now ${next.length}`,
+                );
+                const data: SyncCompletedResult = {
+                    addedToCompleted,
+                    completedSetSize: next.length,
+                    sidecarReportedCount:
+                        typeof json.count === 'number' ? json.count : incoming.length,
+                    scannedFolder: typeof json.scanned_folder === 'string'
+                        ? json.scanned_folder
+                        : '',
+                };
                 return { ok: true, data };
             }
             case 'test-sidecar': {

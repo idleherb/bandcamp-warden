@@ -8,6 +8,7 @@ import type {
     ResolveFirstUrlResult,
     SaveConfigResult,
     SetEnabledResult,
+    SyncCompletedResult,
     TestSidecarResult,
 } from '../shared/messages.js';
 import { send } from '../shared/messages.js';
@@ -229,6 +230,13 @@ document.getElementById('btn-test-sidecar')?.addEventListener('click', () =>
     void runMessage<TestSidecarResult>(
         { type: 'test-sidecar' },
         'test-sidecar',
+        'config-result',
+    ),
+);
+document.getElementById('btn-sync-completed')?.addEventListener('click', () =>
+    void runMessage<SyncCompletedResult>(
+        { type: 'sync-completed-from-sidecar' },
+        'sync-completed-from-sidecar',
         'config-result',
     ),
 );

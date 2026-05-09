@@ -3237,6 +3237,44 @@ async def inbox_status() -> dict:
     return inbox_watcher.status()
 
 
+@app.get("/list-completed-ids")
+async def list_completed_ids() -> dict:
+    """Scan /downloads recursively for bandcamp_<id>.json markers and
+    return the item ids. The Plan-E extension calls this once to seed
+    its `completed` set so refreshQueue doesn't re-queue items that
+    are already on disk from prior bandcampsync runs.
+
+    Folders that exist but lack a JSON marker (Plan-A bug remnants,
+    half-extracted items, manually-added folders) are intentionally
+    NOT included — those need a fresh download to land properly.
+    """
+    return await asyncio.to_thread(_list_completed_ids_sync)
+
+
+def _list_completed_ids_sync() -> dict:
+    downloads = Path(settings.downloads_view_path)
+    pattern = re.compile(r'^bandcamp_(\d+)\.json$')
+    if not downloads.exists():
+        return {
+            "completed_ids": [],
+            "count": 0,
+            "scanned_folder": str(downloads),
+            "exists": False,
+        }
+    ids: set[int] = set()
+    # rglob across ~3k folders is well under a second — no need for streaming.
+    for p in downloads.rglob('bandcamp_*.json'):
+        m = pattern.match(p.name)
+        if m:
+            ids.add(int(m.group(1)))
+    return {
+        "completed_ids": sorted(ids),
+        "count": len(ids),
+        "scanned_folder": str(downloads),
+        "exists": True,
+    }
+
+
 @app.post("/inbox/upload")
 async def inbox_upload(
     item_id: int,

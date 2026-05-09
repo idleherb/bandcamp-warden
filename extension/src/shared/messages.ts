@@ -7,7 +7,8 @@ export type Message =
     | { type: 'reset-run-state' }
     | { type: 'reset-config' }
     | { type: 'save-config'; config: Partial<import('./types.js').Config> }
-    | { type: 'test-sidecar' };
+    | { type: 'test-sidecar' }
+    | { type: 'sync-completed-from-sidecar' };
 
 export interface FetchFanIdResult {
     fanId: number;
@@ -46,6 +47,13 @@ export interface TestSidecarResult {
     durationMs: number;
     sidecarVersion?: string;
     inboxStatus?: unknown;
+}
+
+export interface SyncCompletedResult {
+    addedToCompleted: number;
+    completedSetSize: number;
+    sidecarReportedCount: number;
+    scannedFolder: string;
 }
 
 export type MessageResponse<T = unknown> =
