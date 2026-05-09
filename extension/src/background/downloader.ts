@@ -87,7 +87,11 @@ async function uploadViaSidecar(
         if (!bandcampResp.ok) {
             throw new Error(`bandcamp fetch ${bandcampResp.status} ${bandcampResp.statusText}`);
         }
-        blob = await bandcampResp.blob();
+        // Read body via ReadableStream so we can log progress every few
+        // seconds — without this, a stalled CDN connection looks identical
+        // to a working slow download for many minutes. Memory cost is the
+        // same as response.blob() since chunks are held until Blob is built.
+        blob = await readWithProgress(bandcampResp, item.id);
     } finally {
         clearTimeout(fetchTimer);
     }
@@ -141,6 +145,53 @@ async function uploadViaSidecar(
 function buildUploadUrl(baseUrl: string, itemId: number): string {
     const trimmed = baseUrl.replace(/\/+$/, '');
     return `${trimmed}/inbox/upload?item_id=${itemId}`;
+}
+
+const PROGRESS_LOG_INTERVAL_MS = 5000;
+
+async function readWithProgress(response: Response, itemId: number): Promise<Blob> {
+    if (!response.body) {
+        // Some Firefox builds don't expose body on a Response; fall back to
+        // .blob() and lose progress visibility for that one download.
+        return response.blob();
+    }
+    const totalRaw = response.headers.get('content-length');
+    const total = totalRaw ? parseInt(totalRaw, 10) : 0;
+    const contentType = response.headers.get('content-type') ?? 'application/zip';
+    const reader = response.body.getReader();
+    // BlobPart[] rather than Uint8Array[] — TS narrows Uint8Array's
+    // backing buffer to ArrayBuffer | SharedArrayBuffer, and Blob's
+    // constructor signature only accepts ArrayBuffer-backed parts.
+    // BlobPart is the declared type for the constructor's array.
+    const chunks: BlobPart[] = [];
+    let received = 0;
+    let lastLogAt = performance.now();
+    void log.info(
+        `fetching item ${itemId}: total=${total > 0 ? `${total} bytes` : 'unknown'}`,
+    );
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+            chunks.push(value as BlobPart);
+            received += value.byteLength;
+            const now = performance.now();
+            if (now - lastLogAt >= PROGRESS_LOG_INTERVAL_MS) {
+                const pct = total > 0 ? ` (${((received / total) * 100).toFixed(1)}%)` : '';
+                const mb = (received / (1024 * 1024)).toFixed(1);
+                void log.info(`fetching item ${itemId}: ${mb} MB received${pct}`);
+                lastLogAt = now;
+            }
+        }
+    } finally {
+        try {
+            reader.releaseLock();
+        } catch {
+            // ignore — reader may already be released on cancel
+        }
+    }
+    return new Blob(chunks, { type: contentType });
 }
 
 // ---------- Path B: browser.downloads.download (SMB / local) ----------
