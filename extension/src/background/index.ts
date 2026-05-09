@@ -55,6 +55,80 @@ function sidecarUrlOrThrow(cfg: Config, path: string): string {
     return `${trimmed}${path.startsWith('/') ? path : `/${path}`}`;
 }
 
+interface SyncCompletedOutcome {
+    addedToCompleted: number;
+    completedSetSize: number;
+    sidecarReportedCount: number;
+    scannedFolder: string;
+}
+
+/**
+ * Pull the completed-ids list from the sidecar and union it into the
+ * extension's local completedStore. Returns the outcome stats. Throws on
+ * failure (network, auth, missing config) so callers can decide whether
+ * to surface or swallow the error.
+ */
+async function syncCompletedFromSidecar(): Promise<SyncCompletedOutcome> {
+    const cfg = await configStore.get();
+    const url = sidecarUrlOrThrow(cfg, '/list-completed-ids');
+    const res = await fetch(url, { method: 'GET' });
+    if (!res.ok) {
+        throw new Error(`${url} returned HTTP ${res.status} ${res.statusText}`);
+    }
+    const json = (await res.json()) as {
+        completed_ids?: number[];
+        count?: number;
+        scanned_folder?: string;
+    };
+    const incoming = Array.isArray(json.completed_ids) ? json.completed_ids : [];
+    let addedToCompleted = 0;
+    const next = await completedStore.update((cur) => {
+        const have = new Set(cur);
+        const merged = [...cur];
+        for (const id of incoming) {
+            if (!have.has(id)) {
+                have.add(id);
+                merged.push(id);
+                addedToCompleted++;
+            }
+        }
+        return merged;
+    });
+    return {
+        addedToCompleted,
+        completedSetSize: next.length,
+        sidecarReportedCount:
+            typeof json.count === 'number' ? json.count : incoming.length,
+        scannedFolder: typeof json.scanned_folder === 'string' ? json.scanned_folder : '',
+    };
+}
+
+/**
+ * Best-effort variant for code paths that should still proceed even if
+ * the sync fails (sidecar momentarily unreachable, no config yet, etc.).
+ * Logs a warning instead of throwing.
+ */
+async function syncCompletedFromSidecarBestEffort(label: string): Promise<void> {
+    try {
+        const cfg = await configStore.get();
+        if (!cfg.sidecarBaseUrl || !cfg.sidecarAuthToken) {
+            // Sidecar isn't configured yet; nothing to sync.
+            return;
+        }
+        const out = await syncCompletedFromSidecar();
+        if (out.addedToCompleted > 0) {
+            await log.info(
+                `${label}: auto-synced from sidecar (+${out.addedToCompleted} ids, ` +
+                `set size ${out.completedSetSize}/${out.sidecarReportedCount})`,
+            );
+        }
+    } catch (err) {
+        await log.warn(
+            `${label}: auto-sync from sidecar failed (continuing with local cache): ${describeError(err)}`,
+        );
+    }
+}
+
 function describeError(err: unknown): string {
     if (err instanceof Error) return `${err.name}: ${err.message}`;
     if (typeof err === 'string') return err;
@@ -129,6 +203,11 @@ async function handleMessage(message: Message): Promise<MessageResponse> {
             }
             case 'refresh-queue': {
                 await log.info('refresh-queue requested');
+                // Auto-sync completed IDs from sidecar before dedupe so we
+                // see the disk truth (filesystem markers) and don't re-queue
+                // items that are already on the NAS. Best-effort — if the
+                // sidecar is unreachable we still proceed with local cache.
+                await syncCompletedFromSidecarBestEffort('refresh-queue');
                 const ctx = await fetchHomepageContext();
                 let pages = 0;
                 const items = await paginateCollection(ctx.fanId, {
@@ -193,6 +272,11 @@ async function handleMessage(message: Message): Promise<MessageResponse> {
             }
             case 'reset-run-state': {
                 await resetRunState();
+                // After wiping local state, immediately re-seed completed
+                // from the sidecar's disk markers — otherwise the next
+                // refresh-queue would treat 297 already-finalized items as
+                // pending. Best-effort.
+                await syncCompletedFromSidecarBestEffort('reset-run-state');
                 return { ok: true, data: { reset: true } };
             }
             case 'reset-config': {
@@ -209,47 +293,13 @@ async function handleMessage(message: Message): Promise<MessageResponse> {
                 return { ok: true, data };
             }
             case 'sync-completed-from-sidecar': {
-                const cfg = await configStore.get();
-                const url = sidecarUrlOrThrow(cfg, '/list-completed-ids');
-                await log.info('sync-completed-from-sidecar requested');
-                const res = await fetch(url, { method: 'GET' });
-                if (!res.ok) {
-                    throw new Error(
-                        `${url} returned HTTP ${res.status} ${res.statusText}`,
-                    );
-                }
-                const json = (await res.json()) as {
-                    completed_ids?: number[];
-                    count?: number;
-                    scanned_folder?: string;
-                };
-                const incoming = Array.isArray(json.completed_ids) ? json.completed_ids : [];
-                let addedToCompleted = 0;
-                const next = await completedStore.update((cur) => {
-                    const have = new Set(cur);
-                    const merged = [...cur];
-                    for (const id of incoming) {
-                        if (!have.has(id)) {
-                            have.add(id);
-                            merged.push(id);
-                            addedToCompleted++;
-                        }
-                    }
-                    return merged;
-                });
+                await log.info('sync-completed-from-sidecar requested (manual)');
+                const out = await syncCompletedFromSidecar();
                 await log.info(
-                    `sync-completed: sidecar reported ${incoming.length}, ` +
-                    `added ${addedToCompleted} new, completed-set is now ${next.length}`,
+                    `sync-completed: sidecar reported ${out.sidecarReportedCount}, ` +
+                    `added ${out.addedToCompleted} new, completed-set is now ${out.completedSetSize}`,
                 );
-                const data: SyncCompletedResult = {
-                    addedToCompleted,
-                    completedSetSize: next.length,
-                    sidecarReportedCount:
-                        typeof json.count === 'number' ? json.count : incoming.length,
-                    scannedFolder: typeof json.scanned_folder === 'string'
-                        ? json.scanned_folder
-                        : '',
-                };
+                const data: SyncCompletedResult = out;
                 return { ok: true, data };
             }
             case 'test-sidecar': {
@@ -325,4 +375,5 @@ void Promise.all([
 ])
     .then(() => recoverOrphanedInFlight())
     .then(() => ensureAlarm())
+    .then(() => syncCompletedFromSidecarBestEffort('startup'))
     .then(() => log.info(`background script loaded, version ${VERSION}`));
