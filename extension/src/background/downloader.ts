@@ -63,7 +63,8 @@ async function uploadViaSidecar(
     if (!config.sidecarAuthToken) {
         throw new Error('sidecarAuthToken is empty (set it in Options)');
     }
-    const uploadUrl = buildUploadUrl(config.sidecarBaseUrl, item.id);
+    const uploadExt = uploadExtensionFor(signedUrl, config.format);
+    const uploadUrl = buildUploadUrl(config.sidecarBaseUrl, item.id, uploadExt);
 
     void log.info(
         `download starting (sidecar-upload): item ${item.id} (${item.bandName} — ${item.itemTitle})`,
@@ -137,12 +138,12 @@ async function uploadViaSidecar(
             );
         }
         void log.info(
-            `download done (sidecar-upload): item ${item.id}, ${bytes} bytes`,
+            `download done (sidecar-upload): item ${item.id}, ${bytes} bytes, ext=${uploadExt}`,
         );
         return {
             transport: 'sidecar-upload',
             bytes,
-            targetHint: `${config.sidecarBaseUrl}/inbox/${item.id}`,
+            targetHint: `${config.sidecarBaseUrl}/inbox/${item.id}.${uploadExt}`,
         };
     } finally {
         clearTimeout(uploadTimer);
@@ -202,9 +203,26 @@ async function readWithProgress(
     return new Blob(chunks, { type: contentType });
 }
 
-function buildUploadUrl(baseUrl: string, itemId: number): string {
+function buildUploadUrl(baseUrl: string, itemId: number, ext: string): string {
     const trimmed = baseUrl.replace(/\/+$/, '');
-    return `${trimmed}/inbox/upload?item_id=${itemId}`;
+    return `${trimmed}/inbox/upload?item_id=${itemId}&ext=${encodeURIComponent(ext)}`;
+}
+
+function uploadExtensionFor(signedUrl: string, format: DownloadFormat): string {
+    // Bandcamp's signed URL path tells us album vs single track. Albums
+    // come as a ZIP archive; single-track purchases come as a raw audio
+    // file in the chosen format. If we save tracks as .zip, the watcher
+    // sees BadZipFile and quarantines — that's what cost us ~13% of
+    // overnight items before this fix.
+    try {
+        const path = new URL(signedUrl).pathname;
+        if (path.includes('/download/track')) {
+            return FORMAT_EXT[format];
+        }
+    } catch {
+        // Fall through to album default.
+    }
+    return 'zip';
 }
 
 const PROGRESS_LOG_INTERVAL_MS = 5000;

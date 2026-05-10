@@ -1068,7 +1068,12 @@ class InboxWatcher:
     cache, extracts into <Artist>/<Album>/, writes bandcamp_<id>.json,
     appends to ignores.txt, deletes the ZIP."""
 
-    _FILENAME_RE = re.compile(r'^bandcamp_(\d+)\.zip$')
+    # Match either album ZIPs (bandcamp_<id>.zip) or single-track audio
+    # files (bandcamp_<id>.flac / .mp3 / .m4a / .ogg / .wav / .aiff / .opus).
+    # Audio extensions must match downloader.ts FORMAT_EXT mapping.
+    _FILENAME_RE = re.compile(
+        r'^bandcamp_(\d+)\.(zip|flac|mp3|m4a|ogg|vorbis|wav|aiff|aif|opus|alac)$'
+    )
 
     def __init__(
         self,
@@ -1179,7 +1184,10 @@ class InboxWatcher:
         leftovers from upload-aborts and won't be completed."""
         cutoff = datetime.now(timezone.utc).timestamp() - settings.inbox_partial_max_age_seconds
         try:
-            partials = list(self.inbox_path.glob('bandcamp_*.zip.partial'))
+            partials = [
+                p for p in self.inbox_path.glob('bandcamp_*.partial')
+                if p.is_file()
+            ]
         except OSError:
             return
         for p in partials:
@@ -1191,31 +1199,37 @@ class InboxWatcher:
                 continue
 
     async def _process_pending(self) -> None:
-        """One sweep of the inbox. Reads the directory, picks ZIPs that
-        are old enough to be considered fully written, processes them
-        sequentially. Sequential is intentional — extracting multiple
-        500MB ZIPs in parallel would thrash any home-NAS disk."""
+        """One sweep of the inbox. Picks files that are old enough to be
+        considered fully written and dispatches them sequentially. Both
+        album ZIPs (bandcamp_<id>.zip) and single-track audio files
+        (bandcamp_<id>.<audio_ext>) are recognized."""
         try:
-            zips = sorted(self.inbox_path.glob('bandcamp_*.zip'))
+            entries = [
+                p for p in self.inbox_path.glob('bandcamp_*')
+                if p.is_file() and not p.name.endswith('.partial')
+            ]
         except OSError as e:
             self._last_error = f'inbox listing failed: {e}'
             return
-        if not zips:
+        if not entries:
             return
         cutoff = datetime.now(timezone.utc).timestamp() - settings.inbox_min_file_age_seconds
         ready: list[tuple[int, Path]] = []
-        for zp in zips:
+        for entry in sorted(entries):
             try:
-                mtime = zp.stat().st_mtime
+                mtime = entry.stat().st_mtime
             except OSError:
                 continue
             if mtime > cutoff:
                 continue
-            m = self._FILENAME_RE.match(zp.name)
+            m = self._FILENAME_RE.match(entry.name)
             if not m:
-                log.warning('inbox: filename does not match pattern, ignoring: %s', zp.name)
+                log.warning(
+                    'inbox: filename does not match pattern, ignoring: %s',
+                    entry.name,
+                )
                 continue
-            ready.append((int(m.group(1)), zp))
+            ready.append((int(m.group(1)), entry))
         if not ready:
             return
 
@@ -1274,14 +1288,15 @@ class InboxWatcher:
             self._api_cache = api_map
             self._api_cache_at = now
 
-    def _process_one(self, item_id: int, zip_path: Path, api_row: dict | None) -> None:
-        """Synchronous core: extract one ZIP, write JSON, update ignores,
-        delete original. Runs in a worker thread."""
+    def _process_one(self, item_id: int, file_path: Path, api_row: dict | None) -> None:
+        """Synchronous core: process one inbox file (ZIP album or single-
+        track audio), write JSON, update ignores, delete original. Runs
+        in a worker thread."""
         if api_row is None:
             log.warning(
                 'inbox: no Fan API row for item %d, quarantining', item_id
             )
-            self._quarantine(zip_path, reason='no_api_row')
+            self._quarantine(file_path, reason='no_api_row')
             return
 
         band = clean_path_component(api_row.get('band_name', ''))
@@ -1290,7 +1305,7 @@ class InboxWatcher:
             log.warning(
                 'inbox: API row for item %d missing band/title, quarantining', item_id
             )
-            self._quarantine(zip_path, reason='blank_band_or_title')
+            self._quarantine(file_path, reason='blank_band_or_title')
             return
         target_folder = self.downloads_view / band / title
         json_marker = target_folder / f'bandcamp_{item_id}.json'
@@ -1302,11 +1317,24 @@ class InboxWatcher:
                 'inbox: item %d already finalized at %s, removing inbox copy',
                 item_id, target_folder,
             )
-            zip_path.unlink(missing_ok=True)
+            file_path.unlink(missing_ok=True)
             self._processed_count += 1
             self._last_processed_at = datetime.now(timezone.utc)
             return
 
+        if file_path.suffix.lower() == '.zip':
+            self._process_zip_payload(item_id, file_path, target_folder, json_marker, api_row)
+        else:
+            self._process_track_payload(item_id, file_path, target_folder, json_marker, api_row)
+
+    def _process_zip_payload(
+        self,
+        item_id: int,
+        zip_path: Path,
+        target_folder: Path,
+        json_marker: Path,
+        api_row: dict,
+    ) -> None:
         # Extract into a staging folder first, then rename to the final
         # name. If extract fails partway, the half-baked folder doesn't
         # collide with bandcampsync's existing layout.
@@ -1329,10 +1357,6 @@ class InboxWatcher:
                 self._quarantine(zip_path, reason='no_audio_after_extract')
                 return
 
-            # Move staging into final position. If target already exists
-            # (rare — we checked json_marker above; but bandcampsync may
-            # have written a folder without our JSON marker), merge files
-            # in rather than clobber.
             target_folder.parent.mkdir(parents=True, exist_ok=True)
             if target_folder.exists():
                 for src in staging.iterdir():
@@ -1348,24 +1372,18 @@ class InboxWatcher:
             else:
                 staging.rename(target_folder)
 
-            # Write canonical JSON marker (matches MetadataEnricher format).
             record = self.metadata_enricher._build_record(
                 item_id, target_folder, api_row
             )
             self.metadata_enricher._atomic_write(
                 json_marker, json.dumps(record, ensure_ascii=False, indent=2)
             )
-
-            # Append to ignores.txt so any future bandcampsync run skips
-            # this item. Ignores append is idempotent — duplicate lines
-            # are harmless to bandcampsync.
             self._append_to_ignores(item_id)
-
             zip_path.unlink(missing_ok=True)
             self._processed_count += 1
             self._last_processed_at = datetime.now(timezone.utc)
             log.info(
-                'inbox: processed item %d → %s (audio_files=%d)',
+                'inbox: processed album %d → %s (audio_files=%d)',
                 item_id, target_folder, len(audio_files),
             )
         except zipfile.BadZipFile:
@@ -1375,6 +1393,61 @@ class InboxWatcher:
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
+
+    def _process_track_payload(
+        self,
+        item_id: int,
+        track_path: Path,
+        target_folder: Path,
+        json_marker: Path,
+        api_row: dict,
+    ) -> None:
+        # Single-track items (Bandcamp's /download/track endpoint returns
+        # a raw audio file, not a ZIP). Mirror bandcampsync's layout:
+        # <Artist>/<Title>/<Artist> - <Title>.<ext>, so backfill_metadata
+        # and the user's existing folder pattern stays consistent.
+        ext = track_path.suffix  # includes leading '.'
+        if ext.lower().lstrip('.') not in {e.lstrip('.') for e in _AUDIO_EXTS}:
+            log.warning(
+                'inbox: unexpected track extension %s for item %d, quarantining',
+                ext, item_id,
+            )
+            self._quarantine(track_path, reason=f'unknown_track_ext:{ext}')
+            return
+
+        raw_band = api_row.get('band_name') or ''
+        raw_title = api_row.get('item_title') or ''
+        cleaned_stem = clean_path_component(f'{raw_band} - {raw_title}')
+        leaf = _truncate_filename(cleaned_stem + ext)
+        target_folder.parent.mkdir(parents=True, exist_ok=True)
+        target_folder.mkdir(parents=True, exist_ok=True)
+        target_file = target_folder / leaf
+
+        if target_file.exists():
+            # Don't clobber a file that's already there — could be an
+            # artifact from a previous bandcampsync run with slightly
+            # different naming. Leave the inbox copy in place; user can
+            # reconcile manually.
+            log.warning(
+                'inbox: track target already exists at %s; leaving inbox copy in place',
+                target_file,
+            )
+            return
+
+        shutil.move(str(track_path), str(target_file))
+
+        record = self.metadata_enricher._build_record(
+            item_id, target_folder, api_row
+        )
+        self.metadata_enricher._atomic_write(
+            json_marker, json.dumps(record, ensure_ascii=False, indent=2)
+        )
+        self._append_to_ignores(item_id)
+        self._processed_count += 1
+        self._last_processed_at = datetime.now(timezone.utc)
+        log.info(
+            'inbox: processed track %d → %s', item_id, target_file,
+        )
 
     def _extract_zip(
         self, zip_path: Path, target_folder: Path, item_id: int
@@ -3603,18 +3676,28 @@ def _list_completed_ids_sync() -> dict:
     }
 
 
+_VALID_UPLOAD_EXT_RE = re.compile(r'^[a-zA-Z0-9-]{1,10}$')
+
+
 @app.post("/inbox/upload")
 async def inbox_upload(
     item_id: int,
     request: Request,
+    ext: str = "zip",
     x_warden_auth: str = Header(default=""),
 ) -> dict:
-    """Accept a streamed ZIP from the Plan-E browser extension and write
-    it directly to <downloads>/_inbox/bandcamp_<item_id>.zip — no SMB
+    """Accept a streamed file from the Plan-E browser extension and write
+    it directly to <downloads>/_inbox/bandcamp_<item_id>.<ext> — no SMB
     round trip from the user's Mac. Auth via shared secret in the
     X-Warden-Auth header. Body is streamed chunk-by-chunk to a .partial
     file and atomically renamed on success, so the watcher never reads
-    a half-written ZIP.
+    a half-written file.
+
+    The ext parameter lets the extension distinguish album-ZIPs from
+    single-track audio files (Bandcamp returns the raw FLAC/MP3/etc.
+    when you download a single track, not a ZIP wrapper). Without this
+    distinction, single-track items get saved as bandcamp_<id>.zip and
+    quarantined as BadZipFile by the watcher.
     """
     expected = settings.inbox_upload_auth_token
     if not expected:
@@ -3627,6 +3710,11 @@ async def inbox_upload(
         raise HTTPException(status_code=401, detail="bad auth")
     if item_id <= 0:
         raise HTTPException(status_code=400, detail="invalid item_id")
+    if not _VALID_UPLOAD_EXT_RE.match(ext):
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid ext (allowed: alphanumeric + dash, max 10 chars): {ext!r}",
+        )
 
     inbox = Path(settings.downloads_view_path) / settings.inbox_subfolder
     try:
@@ -3634,8 +3722,8 @@ async def inbox_upload(
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"inbox mkdir: {e}") from e
 
-    target = inbox / f"bandcamp_{item_id}.zip"
-    partial = inbox / f"bandcamp_{item_id}.zip.partial"
+    target = inbox / f"bandcamp_{item_id}.{ext}"
+    partial = inbox / f"bandcamp_{item_id}.{ext}.partial"
 
     if target.exists():
         # Idempotent re-upload: report the existing file's size and bail.
