@@ -26,6 +26,7 @@ import zipfile
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Iterable
 
@@ -1644,22 +1645,37 @@ class ProgressTracker:
         total = await self.get_collection_total()
 
         snapshots = data.get('snapshots') or []
-        # Today-delta: snapshot from ~24h ago. If none (fresh install),
-        # treat as 0 — first day's "today" count is meaningless.
-        ref_24h = None
-        cutoff_24h = now.timestamp() - 24 * 3600
+        # Today-delta: count progressed since today's local midnight (in
+        # the configured timezone). Find the latest snapshot taken at or
+        # before that boundary; fall back to 0 only when truly no
+        # baseline exists (Plan E started today, no pre-midnight data).
+        # Earlier code used "ts <= now - 24h" which always returned 0
+        # on day 1 because the first_run snapshot was <24h old, even
+        # though it represented the natural baseline.
+        try:
+            local_tz = ZoneInfo(settings.timezone)
+        except Exception:
+            local_tz = timezone.utc
+        local_now = now.astimezone(local_tz)
+        midnight_local = local_now.replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        )
+        cutoff_today = midnight_local.timestamp()
+        ref_today: dict | None = None
         for s in reversed(snapshots):
             try:
                 ts = datetime.fromisoformat(s['ts']).timestamp()
             except (KeyError, ValueError):
                 continue
-            if ts <= cutoff_24h:
-                ref_24h = s
+            if ts <= cutoff_today:
+                ref_today = s
                 break
-        if ref_24h is not None:
-            today_completed = max(0, completed - int(ref_24h.get('completed', 0)))
+        if ref_today is not None:
+            today_completed = max(
+                0, completed - int(ref_today.get('completed', 0)),
+            )
             today_quarantined = max(
-                0, quarantined - int(ref_24h.get('quarantined', 0)),
+                0, quarantined - int(ref_today.get('quarantined', 0)),
             )
         else:
             today_completed = 0
