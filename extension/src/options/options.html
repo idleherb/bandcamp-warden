@@ -101,15 +101,15 @@
         </section>
 
         <section>
-            <h2>Scheduler</h2>
+            <h2>Downloads</h2>
             <p class="muted small">
-                "Process one tick (force)" downloads exactly one item now (bypasses
-                cooldown + enabled flag). Toggle enabled to run autonomously.
+                "Start" lets the warden run on its own, pulling one item every few minutes
+                until the daily quota is reached. "Download one now" grabs a single item
+                immediately, even while paused.
             </p>
             <div class="buttons">
-                <button id="btn-tick" type="button">Process one tick</button>
-                <button id="btn-tick-force" type="button">Process one tick (force)</button>
-                <button id="btn-toggle-enabled" type="button">Toggle enabled</button>
+                <button id="btn-tick-force" type="button">Download one now</button>
+                <button id="btn-toggle-enabled" type="button">Start</button>
                 <button id="btn-reset-state" type="button">Reset run state</button>
             </div>
             <pre id="scheduler-result" class="result"></pre>

@@ -83,9 +83,15 @@ async function uploadViaSidecar(
 
     let blob: Blob | null = null;
     try {
+        // cache: 'no-store' tells Firefox not to copy the response into its
+        // HTTP cache. Without it, every 200-500 MB ZIP gets retained in the
+        // browser's memory cache even after we consume the blob, which is
+        // what produced the 49 GB extension memory leak observed overnight.
+        // The signed CDN URL is one-shot anyway — caching it is pure waste.
         const bandcampResp = await fetch(signedUrl, {
             credentials: 'include',
             signal: fetchAbort.signal,
+            cache: 'no-store',
         });
         if (!bandcampResp.ok) {
             throw new Error(
@@ -129,6 +135,7 @@ async function uploadViaSidecar(
             },
             body: blob,
             signal: uploadAbort.signal,
+            cache: 'no-store',
         });
         // Drain response body — keeps Firefox from holding the connection.
         const respText = await upResp.text();

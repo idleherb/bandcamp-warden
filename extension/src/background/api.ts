@@ -95,7 +95,7 @@ export interface HomepageContext {
 }
 
 export async function fetchHomepageContext(): Promise<HomepageContext> {
-    const res = await fetch(HOMEPAGE_URL, { credentials: 'include' });
+    const res = await fetch(HOMEPAGE_URL, { credentials: 'include', cache: 'no-store' });
     if (!res.ok) throw new Error(`homepage fetch failed: HTTP ${res.status}`);
     const html = await res.text();
     const blob = parseBlob<HomepageBlob>(html, 'HomepageApp');
@@ -148,6 +148,7 @@ export async function paginateCollection(
                 count: PAGE_SIZE,
                 older_than_token: token,
             }),
+            cache: 'no-store',
         });
         if (!res.ok) throw new Error(`collection_items POST failed: HTTP ${res.status}`);
         const json = (await res.json()) as CollectionResponse;
@@ -204,7 +205,7 @@ export async function resolveSignedDownloadUrl(
     downloadPageUrl: string,
     format: DownloadFormat,
 ): Promise<string> {
-    const res = await fetch(downloadPageUrl, { credentials: 'include' });
+    const res = await fetch(downloadPageUrl, { credentials: 'include', cache: 'no-store' });
     if (!res.ok) throw new Error(`download page fetch failed: HTTP ${res.status}`);
     const html = await res.text();
     const blob = parseBlob<DownloadPageBlob>(html, 'pagedata');

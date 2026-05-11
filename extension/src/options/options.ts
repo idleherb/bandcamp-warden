@@ -84,7 +84,10 @@ async function renderConfigForm(): Promise<void> {
 }
 
 async function renderState(): Promise<void> {
-    renderTable('state', (await stateStore.get()) as unknown as Record<string, unknown>);
+    const state = await stateStore.get();
+    renderTable('state', state as unknown as Record<string, unknown>);
+    const btn = document.getElementById('btn-toggle-enabled') as HTMLButtonElement | null;
+    if (btn) btn.textContent = state.enabled ? 'Pause' : 'Start';
 }
 
 async function renderQueue(): Promise<void> {
@@ -336,30 +339,21 @@ document
     );
 
 document
-    .getElementById('btn-tick')
-    ?.addEventListener('click', () =>
-        void runMessage<ProcessTickResult>(
-            { type: 'process-tick' },
-            'process-tick',
-            'scheduler-result',
-        ),
-    );
-
-document
     .getElementById('btn-tick-force')
     ?.addEventListener('click', () =>
         void runMessage<ProcessTickResult>(
             { type: 'process-tick', force: true },
-            'process-tick (forced)',
+            'download one now',
             'scheduler-result',
         ),
     );
 
 document.getElementById('btn-toggle-enabled')?.addEventListener('click', async () => {
     const cur = await stateStore.get();
+    const next = !cur.enabled;
     await runMessage<SetEnabledResult>(
-        { type: 'set-enabled', value: !cur.enabled },
-        `set-enabled=${!cur.enabled}`,
+        { type: 'set-enabled', value: next },
+        next ? 'start' : 'pause',
         'scheduler-result',
     );
 });
